@@ -10,6 +10,7 @@ mod config;
 mod disk_buffer;
 mod media;
 mod mp4;
+mod storage;
 mod hotkeys;
 mod tray;
 mod update;

@@ -2,7 +2,7 @@
 
 [Русский](README.md) | **English**
 
-A personal Windows overlay written in Rust for screen recording, instant replays, screenshots, and audio controls. Version 0.5 can be built locally; the project is under active development.
+A personal Windows overlay written in Rust for screen recording, instant replays, screenshots, and audio controls. Version 0.6 can be built locally; the project is under active development.
 
 ## Current status
 
@@ -19,6 +19,8 @@ Default shortcuts:
 - **Alt+F10** — save an instant replay.
 
 Shortcuts can be changed in settings. New configurations default to a 45-second replay, “Maximum detail” quality, source resolution, and 60 FPS. Previously saved settings remain unchanged.
+
+The **Settings → Recording** page shows the size of known gallery files and associated originals, plus free disk space. Unknown files and the temporary replay buffer are excluded; file types are inferred from names.
 
 ## Building for Windows
 

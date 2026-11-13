@@ -124,6 +124,14 @@ struct SettingsDialog {
     capturing: Option<usize>,
 }
 
+#[derive(Default)]
+struct StoragePanel {
+    folder: Option<PathBuf>,
+    report: Option<crate::storage::StorageReport>,
+    loading: Option<Receiver<crate::storage::StorageReport>>,
+    failed: bool,
+}
+
 /// Process CPU usage as a share of all cores, like the OBS status bar.
 struct CpuMeter {
     last: Option<(Instant, u64)>,
@@ -177,6 +185,7 @@ pub struct App {
     status: Option<Status>,
     notification: Option<(Instant, String, bool, Arc<OnceLock<Instant>>)>,
     settings: Option<SettingsDialog>,
+    storage_panel: StoragePanel,
     cpu: CpuMeter,
     system_meter: SystemMeter,
     hud_meter: Arc<Mutex<SystemMeter>>,
@@ -294,6 +303,7 @@ impl App {
             status: None,
             notification: None,
             settings: None,
+            storage_panel: StoragePanel::default(),
             cpu: CpuMeter { last: None, percent: 0.0 },
             system_meter: SystemMeter::default(),
             hud_meter: Arc::new(Mutex::new(SystemMeter::default())),
@@ -1977,7 +1987,7 @@ impl App {
                     if let Some((label, bytes)) = low {
                         if !self.low_disk_warned {
                             self.low_disk_warned = true;
-                            self.set_status(tr3!("Poco espacio para {}: quedan unos {} MB.", "Low disk space for {}: about {} MB left.", "Мало места для {}: осталось примерно {} МБ.", label, bytes / 1_000_000), None, true);
+                            self.set_status(tr3!("Poco espacio para {}: quedan unos {} MB. Libera espacio para evitar errores al guardar.", "Low disk space for {}: about {} MB left. Free up space to prevent save errors.", "Мало места для {}: осталось примерно {} МБ. Освободите место, иначе файл может не сохраниться.", label, bytes / 1_000_000), None, true);
                         }
                     } else { self.low_disk_warned = false; }
                 }
@@ -1985,8 +1995,9 @@ impl App {
                 _ => {}
             }
         }
-        let disk_replay = self.is_replaying() && self.config.replay_storage == ReplayStorage::Disk;
-        if (self.is_recording() || disk_replay) && self.disk_check.is_none()
+        let replaying = self.is_replaying();
+        let disk_replay = replaying && self.config.replay_storage == ReplayStorage::Disk;
+        if (self.is_recording() || replaying) && self.disk_check.is_none()
             && self.last_disk_check.is_none_or(|last| last.elapsed() >= Duration::from_secs(30))
         {
             let folder = self.config.output_dir.clone();
@@ -1997,7 +2008,8 @@ impl App {
             self.disk_check = Some(rx);
             thread::spawn(move || {
                 let mut results = Vec::new();
-                if recording { results.push((tr3!("la grabación", "recording", "записи"), crate::platform::sys::free_space(&folder))); }
+                let label = if recording { tr3!("la grabación", "recording", "записи") } else { tr3!("guardar repeticiones", "saving replays", "сохранения откатов") };
+                results.push((label, crate::storage::disk_space(&folder).1));
                 if disk_replay { results.push((tr3!("el búfer temporal", "the replay buffer", "временного буфера отката"), crate::platform::sys::free_space(&std::env::temp_dir()))); }
                 let _ = tx.send(results);
                 wake.request_repaint();
@@ -2196,6 +2208,7 @@ impl App {
     fn open_settings(&mut self) {
         self.refresh_devices();
         self.refresh_sources();
+        self.storage_panel = StoragePanel::default();
         let seconds = self.config.replay_seconds;
         self.settings = Some(SettingsDialog { draft: self.config.clone(), page: SettingsPage::General, capturing: None, replay_duration: format!("{:02}:{:02}", seconds / 60, seconds % 60), selected_source: self.selected });
         // Registered combinations never reach the window, so they could not be typed again.
@@ -2806,6 +2819,10 @@ impl App {
                     ui.set_opacity(progress);
                     egui::ScrollArea::vertical().id_salt(("settings-page", dialog.page as u8)).min_scrolled_height(body).max_height(body).auto_shrink([false, false]).show(ui, |ui| {
                         ui.set_max_width(width - 16.0);
+                        if dialog.page == SettingsPage::Output {
+                            storage_panel(ui, &mut self.storage_panel, &dialog.draft.output_dir, &self.config.gallery_files, language);
+                            ui.add_space(12.0);
+                        }
                         compact_settings_page(ui, dialog, &self.system_devices, &self.mic_devices, &self.sources, source_size);
                     });
                 });
@@ -3006,6 +3023,90 @@ fn viewer_header(ui: &mut egui::Ui, path: &Path, kind: &str, language: Language)
     }).inner
 }
 
+fn storage_size(bytes: u64, language: Language) -> String {
+    let (value, unit) = if bytes >= 1_000_000_000 { (bytes as f64 / 1_000_000_000.0, if language == Language::Russian { "ГБ" } else { "GB" }) }
+        else if bytes >= 1_000_000 { (bytes as f64 / 1_000_000.0, if language == Language::Russian { "МБ" } else { "MB" }) }
+        else if bytes >= 1_000 { (bytes as f64 / 1_000.0, if language == Language::Russian { "КБ" } else { "KB" }) }
+        else { (bytes as f64, if language == Language::Russian { "Б" } else { "B" }) };
+    if bytes < 1_000 { format!("{value:.0} {unit}") } else { format!("{value:.1} {unit}") }
+}
+
+fn storage_panel(ui: &mut egui::Ui, state: &mut StoragePanel, folder: &Path, files: &[PathBuf], language: Language) {
+    let text = |ru, en, es| match language { Language::Russian => ru, Language::English => en, Language::Spanish => es };
+    if let Some(receiver) = state.loading.take() {
+        match receiver.try_recv() {
+            Ok(report) => state.report = Some(report),
+            Err(mpsc::TryRecvError::Empty) => state.loading = Some(receiver),
+            Err(mpsc::TryRecvError::Disconnected) => { state.report = None; state.failed = true; },
+        }
+    }
+    let mut refresh = state.folder.is_none() && state.loading.is_none() && !state.failed;
+    egui::Frame::new().fill(GREY6).corner_radius(6).inner_margin(10).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(text("Место и файлы", "Storage and files", "Espacio y archivos")).strong());
+        ui.add_space(4.0);
+        let current = state.folder.as_deref() == Some(folder);
+        if let Some(report) = &state.report {
+            if !current {
+                ui.label(RichText::new(text("Папка изменена — обновите расчёт.", "Folder changed — refresh the estimate.", "La carpeta ha cambiado: actualiza el cálculo.")).color(YELLOW));
+            } else {
+                let free = report.free.map(|bytes| storage_size(bytes, language)).unwrap_or_else(|| text("недоступно", "unavailable", "no disponible").to_owned());
+                ui.label(RichText::new(format!("{}: {free}", text("Свободно на диске", "Free on disk", "Libre en disco"))).strong());
+                if !report.folder_exists && report.free.is_some() {
+                    ui.add(egui::Label::new(RichText::new(text("Папка ещё не создана; показано место на диске родительской папки.", "Folder does not exist yet; space is shown for its parent disk.", "La carpeta aún no existe; se muestra el espacio del disco superior.")).small().color(TEXT_MUTED)).wrap());
+                }
+                ui.label(format!("{}: {}", text("Известные файлы", "Known files", "Archivos conocidos"), storage_size(report.total(), language)));
+                ui.scope(|ui| {
+                    ui.spacing_mut().interact_size.y = 18.0;
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    for (name, bytes) in [
+                        (text("Видео", "Videos", "Vídeos"), report.videos),
+                        (text("Откаты", "Replays", "Repeticiones"), report.replays),
+                        (text("Снимки", "Screenshots", "Capturas"), report.screenshots),
+                        (text("Оригиналы обрезки", "Trim originals", "Originales recortados"), report.originals),
+                    ] {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(name).small().color(TEXT_MUTED));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| { ui.label(RichText::new(storage_size(bytes, language)).small().color(TEXT_MUTED)); });
+                        });
+                    }
+                });
+                if report.other > 0 { ui.label(format!("{}: {}", text("Другие известные файлы", "Other known files", "Otros archivos conocidos"), storage_size(report.other, language))); }
+                if report.missing > 0 || report.inaccessible > 0 {
+                    ui.add(egui::Label::new(RichText::new(text("Не все файлы доступны; итог может быть неполным.", "Some files are unavailable; the total may be incomplete.", "Algunos archivos no están disponibles; el total puede estar incompleto.")).small().color(YELLOW)).wrap());
+                }
+                ui.add(egui::Label::new(RichText::new(text("Учтены файлы галереи и связанные оригиналы, в том числе в других папках. Тип определяется по имени; временный буфер и неизвестные файлы не учтены.", "Includes gallery files and related originals, including in other folders. Type is based on the name. Unknown files and the temporary replay buffer are excluded.", "Incluye archivos de la galería y originales relacionados en otras carpetas. El tipo se determina por el nombre. No incluye archivos desconocidos ni el búfer temporal.")).small().color(TEXT_MUTED)).wrap());
+            }
+        } else if state.loading.is_some() || refresh {
+            ui.label(text("Считаем…", "Calculating…", "Calculando…"));
+        } else {
+            ui.label(text("Не удалось получить данные.", "Could not get storage information.", "No se pudo obtener información del espacio."));
+        }
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            if ui.add_enabled(state.loading.is_none(), Button::new(text("Обновить", "Refresh", "Actualizar"))).clicked() { refresh = true; }
+            let can_open = current && state.report.as_ref().is_some_and(|report| report.folder_exists);
+            if ui.add_enabled(can_open, Button::new(text("Открыть папку", "Open folder", "Abrir carpeta"))).clicked() {
+                crate::platform::sys::open_folder(folder);
+            }
+        });
+    });
+    if refresh && state.loading.is_none() {
+        let folder = folder.to_owned();
+        let files = files.to_owned();
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ui.ctx().clone();
+        state.folder = Some(folder.clone());
+        state.report = None;
+        state.failed = false;
+        state.loading = Some(receiver);
+        thread::spawn(move || {
+            let _ = sender.send(crate::storage::measure(&folder, &files));
+            ctx.request_repaint();
+        });
+    }
+}
+
 fn compact_settings_page(ui: &mut egui::Ui, dialog: &mut SettingsDialog, system: &[Device], mic: &[Device], sources: &[Source], source_size: Option<(u32, u32)>) {
     let SettingsDialog { draft: c, page, capturing, replay_duration, selected_source } = dialog;
     let width = ui.available_width().min(330.0);
@@ -3098,10 +3199,13 @@ fn compact_settings_page(ui: &mut egui::Ui, dialog: &mut SettingsDialog, system:
                 let (w, h) = c.resolution.apply(input);
                 let per_minute = (c.quality.selected_bitrate(c.custom_bitrate_mbps, w, h, c.fps) as f64 + 192_000.0) * 60.0 / 8_000_000.0;
                 ui.label(match language {
-                    Language::Russian => format!("Оценка: ≈ {per_minute:.0} МБ/мин · {:.1} ГБ/час", per_minute * 60.0 / 1000.0),
-                    Language::English => format!("Estimate: ≈ {per_minute:.0} MB/min · {:.1} GB/hour", per_minute * 60.0 / 1000.0),
-                    Language::Spanish => format!("Estimación: ≈ {per_minute:.0} MB/min · {:.1} GB/hora", per_minute * 60.0 / 1000.0),
+                    Language::Russian => format!("Оценка размера: ≈ {per_minute:.0} МБ/мин · {:.1} ГБ/час", per_minute * 60.0 / 1000.0),
+                    Language::English => format!("Estimated size: ≈ {per_minute:.0} MB/min · {:.1} GB/hour", per_minute * 60.0 / 1000.0),
+                    Language::Spanish => format!("Tamaño estimado: ≈ {per_minute:.0} MB/min · {:.1} GB/hora", per_minute * 60.0 / 1000.0),
                 });
+                ui.add(egui::Label::new(RichText::new(text("Приблизительно для текущего качества, разрешения и FPS. Фактический размер может отличаться.", "Approximate for the current quality, resolution and FPS. Actual size may vary.", "Estimación según calidad, resolución y FPS. El tamaño real puede variar.")).small().color(TEXT_MUTED)).wrap());
+            } else {
+                ui.add(egui::Label::new(RichText::new(text("Оценка размера появится, когда разрешение источника будет доступно.", "The size estimate appears when the source resolution is available.", "La estimación aparece cuando se conoce la resolución de la fuente.")).small().color(TEXT_MUTED)).wrap());
             }
             let screenshot_label = ui.label(text("Формат скриншота", "Screenshot format", "Formato de captura"));
             combo(ui, "screenshot-format", &mut c.screenshot_format, &ScreenshotFormat::ALL, |format| format.label().into(), width).labelled_by(screenshot_label.id);
@@ -4472,6 +4576,91 @@ mod tests {
     /// The interface language is global; tests that depend on it take this lock.
     static LANGUAGE: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn storage_sizes_show_small_files_without_rounding_to_zero() {
+        assert_eq!(storage_size(0, Language::Russian), "0 Б");
+        assert_eq!(storage_size(999, Language::Russian), "999 Б");
+        assert_eq!(storage_size(21_100, Language::Russian), "21.1 КБ");
+        assert_eq!(storage_size(1_250_000, Language::English), "1.2 MB");
+        assert_eq!(storage_size(1_500_000_000, Language::Russian), "1.5 ГБ");
+    }
+
+    #[test]
+    fn storage_panel_stays_inside_narrow_views_in_all_languages() {
+        let dir = tempfile::tempdir().unwrap();
+        for language in [Language::Russian, Language::English, Language::Spanish] {
+            let ctx = egui::Context::default();
+            let mut state = StoragePanel {
+                folder: Some(dir.path().to_owned()),
+                report: Some(crate::storage::StorageReport { free: Some(999_000_000_000), folder_exists: true, videos: 125_000_000, screenshots: 2_000, ..Default::default() }),
+                ..Default::default()
+            };
+            for _ in 0..2 {
+                let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 600.0))), ..Default::default() }, |ui| {
+                    storage_panel(ui, &mut state, dir.path(), &[], language);
+                });
+                output.textures_delta.clear();
+                let mut shapes: Vec<_> = output.shapes.into_iter().map(|shape| shape.shape).collect();
+                while let Some(shape) = shapes.pop() {
+                    match shape {
+                        egui::Shape::Vec(inner) => shapes.extend(inner),
+                        egui::Shape::Text(text) => {
+                            let bounds = text.visual_bounding_rect();
+                            assert!(bounds.left() >= 0.0 && bounds.right() <= 320.0, "{language:?}: {} outside screen: {bounds:?}", text.galley.text());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn storage_panel_refreshes_on_request_without_scanning_each_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("test — Video.mp4");
+        std::fs::write(&video, [1; 10]).unwrap();
+        let files = [video.clone()];
+        let ctx = egui::Context::default();
+        let mut state = StoragePanel::default();
+        let draw = |state: &mut StoragePanel, events| {
+            let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(420.0, 900.0))), events, ..Default::default() }, |ui| {
+                storage_panel(ui, state, dir.path(), &files, Language::Russian);
+            });
+            output.textures_delta.clear();
+            output.shapes
+        };
+        let _ = draw(&mut state, vec![]);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while state.report.is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+            let _ = draw(&mut state, vec![]);
+        }
+        assert_eq!(state.report.as_ref().unwrap().videos, 10);
+        std::fs::write(&video, [1; 25]).unwrap();
+        let mut shapes: Vec<_> = draw(&mut state, vec![]).into_iter().map(|shape| shape.shape).collect();
+        assert_eq!(state.report.as_ref().unwrap().videos, 10);
+        let mut refresh = None;
+        while let Some(shape) = shapes.pop() {
+            match shape {
+                egui::Shape::Vec(inner) => shapes.extend(inner),
+                egui::Shape::Text(text) if text.galley.text() == "Обновить" => refresh = Some(text.visual_bounding_rect().center()),
+                _ => {}
+            }
+        }
+        let refresh = refresh.expect("refresh button missing");
+        let pointer = |pressed| egui::Event::PointerButton { pos: refresh, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        let _ = draw(&mut state, vec![egui::Event::PointerMoved(refresh), pointer(true)]);
+        let _ = draw(&mut state, vec![pointer(false)]);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while state.loading.is_some() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+            let _ = draw(&mut state, vec![]);
+        }
+        assert_eq!(state.report.as_ref().unwrap().videos, 25);
+        assert!(state.loading.is_none());
+    }
+
     fn test_app() -> App {
         App {
             config: Config { setup_complete: true, ..Config::default() },
@@ -4500,6 +4689,7 @@ mod tests {
             status: None,
             notification: None,
             settings: None,
+            storage_panel: StoragePanel::default(),
             cpu: CpuMeter { last: None, percent: 0.0 },
             system_meter: SystemMeter::default(),
             hud_meter: Arc::new(Mutex::new(SystemMeter::default())),
