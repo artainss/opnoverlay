@@ -38,7 +38,7 @@ gstreamer = "0.25.4"
 gstreamer-app = "0.25.2"
 gstreamer-video = "0.25.4"
 libc = "0.2"
-pollster = "0.4.0"
+pollster = "1.0.1"
 # StatusNotifierItem over D-Bus, without GTK.
 tray-icon = { version = "0.26.0", default-features = false, features = ["ksni"] }
 
