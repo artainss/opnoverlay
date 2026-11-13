@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github._25Dark25.ObsLite</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Obs Lite</name>
+  <summary>Record the screen using few resources</summary>
+  <description>
+    <p>
+      A lightweight screen recorder whose interface follows OBS Studio, so OBS users find
+      everything where they expect it. It is not affiliated with the OBS Project.
+    </p>
+    <ul>
+      <li>Records the screen or a window, chosen in the desktop's sharing dialog</li>
+      <li>Desktop audio and microphone, each with a meter, volume and mute</li>
+      <li>Pause, a region of the screen, screenshots and a webcam overlay</li>
+      <li>Replay buffer: keeps the last seconds in memory and saves them on demand</li>
+      <li>Global hotkeys, kept by the desktop</li>
+      <li>H.264 and AAC in MP4, on the GPU when it has an encoder</li>
+    </ul>
+    <p>
+      The interface is in Spanish or English, following the system language.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github._25Dark25.ObsLite.desktop</launchable>
+  <developer id="io.github._25dark25">
+    <name>25Dark25</name>
+  </developer>
+  <url type="homepage">https://github.com/25Dark25/ObsLite</url>
+  <url type="bugtracker">https://github.com/25Dark25/ObsLite/issues</url>
+  <url type="vcs-browser">https://github.com/25Dark25/ObsLite</url>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/25Dark25/ObsLite/160a9fcd091c85ac79fb9c199e1a44608c872a18/docs/images/main-window.png</image>
+      <caption>Recording, with the preview, the sources, the audio mixer and the controls</caption>
+    </screenshot>
+  </screenshots>
+  <branding>
+    <color type="primary" scheme_preference="light">#f9dcdd</color>
+    <color type="primary" scheme_preference="dark">#5c1a1d</color>
+  </branding>
+  <content_rating type="oars-1.1"/>
+  <requires>
+    <display_length compare="ge">900</display_length>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <releases>
+    <release version="0.6.0" date="2026-10-29">
+      <description>
+        <p>Recording with VA-API (Intel, AMD) keeps the frames on the GPU: about a quarter of the CPU it took, and half with a region and the webcam. Pausing no longer pauses the replay buffer, and many fixes for recordings that cannot be written.</p>
+      </description>
+    </release>
+    <release version="0.5.0" date="2026-10-25">
+      <description>
+        <p>Recordings survive a crash or a power cut, and are repaired at the next start.</p>
+      </description>
+    </release>
+    <release version="0.4.1" date="2026-10-24"/>
+    <release version="0.4.0" date="2026-10-23"/>
+    <release version="0.3.0" date="2026-10-18"/>
+  </releases>
+</component>

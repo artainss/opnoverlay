@@ -1,0 +1,131 @@
+name: Release build
+
+# Run by hand on main once the release is prepared; the release tag then goes on
+# that same commit. It produces the portable zip (executable,
+# LICENSE and third-party license notices), the MSI installer with the same
+# files, the Linux Flatpak bundle, and their SHA-256 as one artifact.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No build cache here, so a poisoned cache entry can never reach a release.
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc -Vv
+      - name: Build
+        run: cargo build --locked --release
+      - name: No Visual C++ runtime needed
+        shell: pwsh
+        run: installer/check-runtime.ps1
+      # Keep version and hash in sync with ci.yml.
+      - name: Install cargo-about
+        shell: bash
+        run: |
+          # Relative paths: GNU tar reads "D:..." as a remote host.
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o cargo-about.tar.gz https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.2/cargo-about-0.9.2-x86_64-pc-windows-msvc.tar.gz
+          echo "1c03e5890238562497c2d89a3b75b02560af349c1fc3e713d3284f532a5cd748  cargo-about.tar.gz" | sha256sum --check
+          tar xzf cargo-about.tar.gz
+          echo "$RUNNER_TEMP/cargo-about-0.9.2-x86_64-pc-windows-msvc" >> "$GITHUB_PATH"
+      - name: Third-party licenses
+        run: cargo about generate --locked --fail about.hbs -o THIRD-PARTY-LICENSES.html
+      # Keep the version in sync with ci.yml.
+      - name: Install WiX
+        run: |
+          dotnet tool install --global wix --version 6.0.2
+          wix extension add --global WixToolset.UI.wixext/6.0.2
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          New-Item -ItemType Directory pkg, dist | Out-Null
+          Copy-Item target/release/opnoverlay.exe, LICENSE, THIRD-PARTY-LICENSES.html pkg
+          Copy-Item third-party/presentmon/PresentMon.exe pkg
+          Copy-Item third-party/presentmon/LICENSE.txt pkg/PRESENTMON-LICENSE.txt
+          $zip = "dist/opnoverlay-$version-portable-windows-x64.zip"
+          Compress-Archive -Path pkg/* -DestinationPath $zip
+          $msi = "dist/opnoverlay-$version-windows-x64.msi"
+          installer/build.ps1 -BinDir pkg -Out $msi -Version $version
+          foreach ($file in $zip, $msi) {
+            "{0}  {1}" -f (Get-FileHash $file -Algorithm SHA256).Hash.ToLower(), (Split-Path $file -Leaf)
+          }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows
+          path: dist/
+          if-no-files-found: error
+
+  flatpak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+      # Keep version and hashes in sync with ci.yml (same release, Linux build).
+      - name: Install cargo-about
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o cargo-about.tar.gz https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.2/cargo-about-0.9.2-x86_64-unknown-linux-musl.tar.gz
+          echo "9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af  cargo-about.tar.gz" | sha256sum --check
+          tar xzf cargo-about.tar.gz
+          echo "$RUNNER_TEMP/cargo-about-0.9.2-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+      - name: Third-party licenses
+        run: cargo about generate --locked --fail --target x86_64-unknown-linux-gnu about.hbs -o THIRD-PARTY-LICENSES.html
+      # The Flatpak build has no network; it reads the crates from ./vendor.
+      - name: Vendor crates
+        run: cargo vendor --locked vendor > /dev/null
+      - name: Build
+        run: >-
+          flatpak-builder --user --install-deps-from=flathub --disable-rofiles-fuse --force-clean
+          --repo=flatpak-repo build-flatpak packaging/flatpak/io.github._25Dark25.ObsLite.yml
+      # The bundle names Flathub as the place to get the runtime from.
+      - name: Bundle
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          mkdir dist
+          flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
+            flatpak-repo "dist/obs-lite-$version-linux-x86_64.flatpak" io.github._25Dark25.ObsLite
+          sha256sum dist/*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: flatpak
+          path: dist/
+          if-no-files-found: error
+
+  checksums:
+    needs: [windows, flatpak]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: obs-lite-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error

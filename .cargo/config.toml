@@ -1,0 +1,4 @@
+# Windows: the C runtime goes into obs-lite.exe. A fresh Windows has no VCRUNTIME140.dll (only
+# other programs bring it), so a build needing it did not start there.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

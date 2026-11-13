@@ -1,0 +1,12 @@
+/target
+/THIRD-PARTY-LICENSES.html
+/vendor
+/.flatpak-builder
+/build-flatpak
+/flatpak-repo
+*.flatpak
+
+/.agents/
+/.wix/
+/docs/ux-0.3.md
+/docs/ux-audit-0.3.md

@@ -1,0 +1,19 @@
+# cargo-about configuration: https://embarkstudios.github.io/cargo-about/
+# Generates THIRD-PARTY-LICENSES.html for release builds. Keep `accepted` in
+# sync with `licenses.allow` in deny.toml.
+
+targets = ["x86_64-pc-windows-msvc"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+accepted = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]

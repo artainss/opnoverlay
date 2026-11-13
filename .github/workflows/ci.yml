@@ -1,0 +1,174 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.toolchain }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        # Keep the first entry in sync with `rust-version` in Cargo.toml.
+        toolchain: ["1.95", stable]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The base plugins (videoconvert, appsrc, videotestsrc…) are what obs-lite needs at run
+      # time; the tests build real pipelines with them.
+      - name: Install GStreamer
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base
+      - name: Install Rust ${{ matrix.toolchain }}
+        run: |
+          rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component clippy
+          rustup default ${{ matrix.toolchain }}
+          rustc -V
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Test
+        run: cargo test --locked
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Release build
+        run: cargo build --locked --release
+
+  deny:
+    name: cargo-deny
+    # The action runs in a Docker container, so it needs Linux; deny.toml
+    # restricts the dependency graph to the Windows target.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          arguments: --all-features --locked
+
+  licenses:
+    name: third-party licenses
+    # Fails if any dependency has a license that is not accepted in about.toml,
+    # so release builds can always generate THIRD-PARTY-LICENSES.html.
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Keep version and hash in sync with release-build.yml.
+      - name: Install cargo-about
+        shell: bash
+        run: |
+          # Relative paths: GNU tar reads "D:..." as a remote host.
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o cargo-about.tar.gz https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.2/cargo-about-0.9.2-x86_64-pc-windows-msvc.tar.gz
+          echo "1c03e5890238562497c2d89a3b75b02560af349c1fc3e713d3284f532a5cd748  cargo-about.tar.gz" | sha256sum --check
+          tar xzf cargo-about.tar.gz
+          echo "$RUNNER_TEMP/cargo-about-0.9.2-x86_64-pc-windows-msvc" >> "$GITHUB_PATH"
+      - name: Generate THIRD-PARTY-LICENSES.html
+        run: cargo about generate --locked --fail about.hbs -o THIRD-PARTY-LICENSES.html
+      # The Flatpak ships its own, for the Linux dependencies.
+      - name: Generate it for Linux
+        run: cargo about generate --locked --fail --target x86_64-unknown-linux-gnu about.hbs -o THIRD-PARTY-LICENSES-linux.html
+
+  installer:
+    name: installer
+    # Builds the MSI and installs, upgrades and uninstalls it for the runner's user.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Release build
+        run: cargo build --locked --release
+      - name: No Visual C++ runtime needed
+        shell: pwsh
+        run: installer/check-runtime.ps1
+      # Keep the version in sync with release-build.yml.
+      - name: Install WiX
+        run: |
+          dotnet tool install --global wix --version 6.0.2
+          wix extension add --global WixToolset.UI.wixext/6.0.2
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory pkg | Out-Null
+          Copy-Item target/release/opnoverlay.exe, LICENSE pkg
+          # The licenses job checks the real file; the installer only needs one to package.
+          Set-Content pkg/THIRD-PARTY-LICENSES.html '<p>placeholder</p>'
+          installer/build.ps1 -BinDir pkg -Out opnoverlay.msi
+          installer/build.ps1 -BinDir pkg -Out opnoverlay-newer.msi -Version 255.0.0
+          wix msi validate opnoverlay.msi
+      - name: Install, upgrade and uninstall
+        shell: pwsh
+        run: installer/test.ps1 -Msi opnoverlay.msi -UpgradeMsi opnoverlay-newer.msi
+
+  flatpak:
+    name: flatpak
+    # Builds the Flatpak as release builds do, and validates its desktop entry and metainfo.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder desktop-file-utils appstream
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+      - name: Validate desktop entry and metainfo
+        run: |
+          desktop-file-validate packaging/flatpak/io.github._25Dark25.ObsLite.desktop
+          appstreamcli validate --no-net packaging/flatpak/io.github._25Dark25.ObsLite.metainfo.xml
+      # The Flatpak build has no network; it reads the crates from ./vendor.
+      - name: Vendor crates
+        run: cargo vendor --locked vendor > /dev/null
+      - name: Build
+        run: >-
+          flatpak-builder --user --install-deps-from=flathub --disable-rofiles-fuse --force-clean
+          build-flatpak packaging/flatpak/io.github._25Dark25.ObsLite.yml
+
+  # Single stable check for the branch ruleset: fails if any job above failed,
+  # was cancelled or was skipped.
+  all-tests:
+    name: all-tests
+    if: always()
+    needs: [test, deny, licenses, installer, flatpak]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Results: $RESULTS"
+          for result in $RESULTS; do
+            [ "$result" = success ] || exit 1
+          done

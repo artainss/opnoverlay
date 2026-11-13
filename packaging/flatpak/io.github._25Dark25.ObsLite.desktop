@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Obs Lite
+GenericName=Screen Recorder
+GenericName[es]=Grabador de pantalla
+Comment=Record the screen using few resources
+Comment[es]=Graba la pantalla consumiendo pocos recursos
+Exec=obs-lite
+Icon=io.github._25Dark25.ObsLite
+StartupWMClass=io.github._25Dark25.ObsLite
+Terminal=false
+Categories=AudioVideo;Video;Recorder;
+Keywords=screen;recorder;record;capture;screencast;video;
+Keywords[es]=pantalla;grabador;grabar;captura;vídeo;

@@ -1,0 +1,115 @@
+
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  
+  <Package Name="opnoverlay" Manufacturer="opnoverlay" Version="$(var.Version)" Language="1033"
+           UpgradeCode="F3536EB9-A21C-40F0-B26E-6ED754D41B54" Scope="perUser">
+    <SummaryInformation Description="opnoverlay $(var.Version) installer" />
+    
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of opnoverlay is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="opnoverlay.ico" SourceFile="$(var.Icon)" />
+    <Property Id="ARPPRODUCTICON" Value="opnoverlay.ico" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize" />
+
+    <Property Id="INSTALLFOLDER">
+      <RegistrySearch Id="ExistingInstallFolder" Root="HKCU" Key="Software\opnoverlay\Installer" Name="InstallDir" Type="raw" />
+    </Property>
+
+    
+    <Property Id="DESKTOPSHORTCUT">
+      <RegistrySearch Root="HKCU" Key="Software\opnoverlay\Installer" Name="DesktopShortcut" Type="raw" />
+    </Property>
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="UserPrograms" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="opnoverlay" />
+      </Directory>
+    </StandardDirectory>
+
+    
+    <Component Id="App" Directory="INSTALLFOLDER" Guid="10A42CE5-1D01-430F-AC2B-59FE60DDB3CD">
+      <File Id="opnoverlayExe" Source="$(var.BinDir)\opnoverlay.exe" />
+      <File Source="$(var.PresentMonDir)\PresentMon.exe" />
+      <File Source="$(var.PresentMonDir)\LICENSE.txt" Name="PRESENTMON-LICENSE.txt" />
+      <File Source="$(var.BinDir)\LICENSE" Name="LICENSE.txt" />
+      <File Source="$(var.BinDir)\THIRD-PARTY-LICENSES.html" />
+      <RegistryValue Root="HKCU" Key="Software\opnoverlay\Installer" Name="InstallDir" Type="string" Value="[INSTALLFOLDER]" />
+      <RegistryValue Root="HKCU" Key="Software\opnoverlay\Installer" Name="App" Type="integer" Value="1" KeyPath="yes" />
+      <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+      <RemoveFolder Id="RemoveUserPrograms" Directory="UserPrograms" On="uninstall" />
+    </Component>
+
+    <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder">
+      <Shortcut Id="StartMenu" Name="opnoverlay" Description="Lightweight screen recorder"
+                Target="[#opnoverlayExe]" WorkingDirectory="INSTALLFOLDER" Icon="opnoverlay.ico" />
+      <RegistryValue Root="HKCU" Key="Software\opnoverlay\Installer" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Component Id="DesktopShortcut" Directory="DesktopFolder" Condition="DESKTOPSHORTCUT = &quot;1&quot;">
+      <Shortcut Id="Desktop" Name="opnoverlay" Description="Lightweight screen recorder"
+                Target="[#opnoverlayExe]" WorkingDirectory="INSTALLFOLDER" Icon="opnoverlay.ico" />
+      <RegistryValue Root="HKCU" Key="Software\opnoverlay\Installer" Name="DesktopShortcut" Type="string" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Feature Id="Main">
+      <ComponentRef Id="App" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+
+    <UIRef Id="opnoverlayUI" />
+  </Package>
+
+  
+  <Fragment>
+    <UI Id="opnoverlayUI">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+
+      <Dialog Id="ShortcutsDlg" Width="370" Height="270" Title="!(loc.WelcomeDlg_Title)">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="!(loc.InstallDirDlgBannerBitmap)" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Shortcuts" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes" Text="Choose where to add shortcuts to opnoverlay." />
+        <Control Id="StartMenu" Type="Text" X="20" Y="60" Width="330" Height="15" NoPrefix="yes" Text="A shortcut is always added to the Start menu." />
+        <Control Id="Desktop" Type="CheckBox" X="20" Y="80" Width="330" Height="17" Property="DESKTOPSHORTCUT" CheckBoxValue="1" Text="Create a shortcut on the &amp;desktop" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)" />
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
+
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="ShortcutsDlg" Condition="NOT Installed" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Condition="Installed AND PATCH" />
+      <Publish Dialog="ShortcutsDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" />
+      <Publish Dialog="ShortcutsDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" />
+
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="ShortcutsDlg" Order="1" Condition="NOT Installed" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2" Condition="Installed AND NOT PATCH" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2" Condition="Installed AND PATCH" />
+
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
+    </UI>
+    <UIRef Id="WixUI_Common" />
+  </Fragment>
+</Wix>
