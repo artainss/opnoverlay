@@ -31,7 +31,7 @@ windows-capture = "2.0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # The desktop portals (D-Bus), driven with pollster.
-ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "camera", "documents", "global_shortcuts", "open_uri", "screencast"] }
+ashpd = { version = "0.14.0", default-features = false, features = ["async-io", "camera", "documents", "global_shortcuts", "open_uri", "screencast"] }
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 futures-util = { version = "0.3.34", default-features = false }
 gstreamer = "0.25.4"
