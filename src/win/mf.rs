@@ -771,16 +771,28 @@ mod tests {
             let mut last_luma = Vec::new();
             let mut max_changed = 0usize;
             let check_changes = std::env::var_os("OPNOVERLAY_CHECK_VIDEO_CHANGES").is_some();
+            let check_camera = std::env::var_os("OPNOVERLAY_CHECK_SYNTHETIC_CAMERA").is_some();
+            let dimensions = if check_camera { reader.GetCurrentMediaType(stream).unwrap().GetUINT64(&MF_MT_FRAME_SIZE).unwrap() } else { 0 };
+            let width = (dimensions >> 32) as usize;
+            let height = dimensions as u32 as usize;
+            let mut camera_frames = 0usize;
             loop {
                 let (mut flags, mut timestamp, mut sample) = (0u32, 0i64, None);
                 reader.ReadSample(stream, 0, None, Some(&mut flags), Some(&mut timestamp), Some(&mut sample)).unwrap();
                 if let Some(sample) = sample {
                     assert!(timestamp >= previous);
                     assert!(sample.GetTotalLength().unwrap() > 0);
-                    if check_changes || (frames == 0 && std::env::var_os("OPNOVERLAY_CHECK_VIDEO_CONTENT").is_some()) {
+                    if check_changes || check_camera || (frames == 0 && std::env::var_os("OPNOVERLAY_CHECK_VIDEO_CONTENT").is_some()) {
                         let buffer = sample.ConvertToContiguousBuffer().unwrap();
                         let (mut data, mut len) = (std::ptr::null_mut(), 0);
                         buffer.Lock(&mut data, None, Some(&mut len)).unwrap();
+                        if check_camera {
+                            let bytes = std::slice::from_raw_parts(data, len as usize);
+                            let x = (width * 85 / 100) & !1;
+                            let y = (height * 80 / 100) & !1;
+                            let uv = width * height + (y / 2) * width + x;
+                            if uv + 1 < bytes.len() && bytes[uv] > 165 && bytes[uv + 1] > 165 { camera_frames += 1; }
+                        }
                         let samples: Vec<u8> = std::slice::from_raw_parts(data, len as usize * 2 / 3).iter().step_by(64).copied().collect();
                         if frames == 0 {
                             luma_levels.extend(samples.iter().copied());
@@ -798,6 +810,10 @@ mod tests {
                 if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 { break; }
             }
             assert!(frames >= 30, "only {frames} frames decoded");
+            if check_camera {
+                assert!(camera_frames > 10, "synthetic camera visible in only {camera_frames} frames");
+                println!("synthetic camera detected in {camera_frames} frames");
+            }
             if std::env::var_os("OPNOVERLAY_CHECK_VIDEO_CONTENT").is_some() {
                 assert!(luma_levels.len() >= 8, "first frame appears blank: {} luminance levels", luma_levels.len());
                 println!("first frame: {} sampled luminance levels", luma_levels.len());
@@ -836,6 +852,7 @@ mod tests {
             assert_eq!(format.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).unwrap(), 2);
             assert_eq!(format.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).unwrap(), 48_000);
             let mut peak = 0i32;
+            let mut decoded = Vec::new();
             let mut samples_440 = 0u64;
             let (mut sine, mut cosine) = (0.0f64, 0.0f64);
             loop {
@@ -847,10 +864,14 @@ mod tests {
                     let buffer = sample.ConvertToContiguousBuffer().unwrap();
                     let (mut data, mut len) = (std::ptr::null_mut(), 0);
                     buffer.Lock(&mut data, None, Some(&mut len)).unwrap();
-                    for chunk in std::slice::from_raw_parts(data, len as usize).chunks_exact(2) {
-                        peak = peak.max(i32::from(i16::from_le_bytes([chunk[0], chunk[1]])).abs());
+                    let audio = std::slice::from_raw_parts(data, len as usize);
+                    if std::env::var_os("OPNOVERLAY_TEST_PCM_OUTPUT").is_some() { decoded.extend_from_slice(audio); }
+                    let (channel_samples, _) = audio.as_chunks::<2>();
+                    for &sample in channel_samples {
+                        peak = peak.max(i32::from(i16::from_le_bytes(sample)).abs());
                     }
-                    for frame in std::slice::from_raw_parts(data, len as usize).chunks_exact(4) {
+                    let (frames, _) = audio.as_chunks::<4>();
+                    for frame in frames {
                         let value = f64::from(i16::from_le_bytes([frame[0], frame[1]]));
                         let phase = samples_440 as f64 * 440.0 * std::f64::consts::TAU / 48_000.0;
                         sine += value * phase.sin();
@@ -862,6 +883,7 @@ mod tests {
                 if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 { break; }
             }
             assert!(samples > 0 && bytes > 0);
+            if let Some(path) = std::env::var_os("OPNOVERLAY_TEST_PCM_OUTPUT") { std::fs::write(path, decoded).unwrap(); }
             let tone = 2.0 * sine.hypot(cosine) / samples_440.max(1) as f64;
             if std::env::var_os("OPNOVERLAY_EXPECT_SOUND").is_some() { assert!(tone > 50.0, "test tone too quiet: {tone}"); }
             println!("decoded {samples} audio samples, {bytes} bytes, peak {peak}, 440 Hz amplitude {tone:.1}");
@@ -928,11 +950,15 @@ mod tests {
         const FRAMES: i64 = 10;
         unsafe {
             let media = Media::start().unwrap();
-            let Some((device, converter)) = gpu(SIZE) else { return };
+            let Some((device, converter)) = gpu(SIZE) else {
+                assert!(std::env::var_os("OPNOVERLAY_REQUIRE_SOFTWARE_ENCODER").is_none(), "no GPU video processor");
+                return;
+            };
             let activate = software_encoders().unwrap().into_iter().next().expect("no software H.264 encoder");
             let h264 = H264::open(&device, &activate, false, SIZE, 30, 1_000_000).unwrap();
             let packets = encode(&h264, &converter, FRAMES, 30);
             assert_eq!(packets.len(), FRAMES as usize);
+            println!("Software H.264 packets: {}", packets.len());
             assert!(packets[0].key);
             assert!(h264.output_type().is_ok());
             drop((h264, converter, media));
@@ -965,11 +991,15 @@ mod tests {
         unsafe {
             let media = Media::start().unwrap();
             // Measures; the devices below come and go.
-            let Some((probe, _)) = gpu((64, 64)) else { return };
+            let Some((probe, _)) = gpu((64, 64)) else {
+                assert!(std::env::var_os("OPNOVERLAY_REQUIRE_HARDWARE_ENCODER").is_none(), "no GPU video processor");
+                return;
+            };
             let mut used = Vec::new();
             for _ in 0..5 {
                 let (device, converter) = gpu(SIZE).unwrap();
                 let Some(activate) = hardware_encoders(&device).unwrap_or_default().into_iter().next() else {
+                    assert!(std::env::var_os("OPNOVERLAY_REQUIRE_HARDWARE_ENCODER").is_none(), "no hardware H.264 encoder");
                     eprintln!("skipped, no hardware H.264 encoder");
                     return;
                 };
@@ -980,6 +1010,7 @@ mod tests {
                 used.push(gpu_memory(&probe));
             }
             let grown = used[4].saturating_sub(used[0]) as f64 / (1 << 20) as f64;
+            println!("GPU allocation after each cycle (bytes): {used:?}; growth: {grown:.1} MiB");
             assert!(grown < 10.0, "GPU memory grew {grown:.0} MB over four more recordings: {used:?}");
             drop(media);
         }

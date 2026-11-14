@@ -15,7 +15,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{ERROR_TIMEOUT, RECT};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_QUERY_DESC, D3D11_QUERY_EVENT,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11DeviceContext, ID3D11Query,
@@ -24,7 +24,7 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::IMFMediaType;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
-use windows::core::BOOL;
+use windows::core::{BOOL, HRESULT};
 use windows_capture::frame::Frame;
 
 use crate::camera::{self, CameraSize, Corner, PixelRect};
@@ -104,24 +104,42 @@ impl Canvas {
     /// convert fails the recording: its frames would be empty (green).
     fn snapshot(&self, slot: usize) -> windows::core::Result<()> {
         let ctx = &self.context.0;
-        unsafe {
-            {
-                let _gpu = self.lock.lock().unwrap();
+        {
+            let _gpu = self.lock.lock().unwrap();
+            unsafe {
                 self.converter.0.convert(slot)?;
                 ctx.End(&self.converted.0);
                 ctx.Flush();
             }
-            for _ in 0..50 {
+        }
+        wait_for_conversion(
+            || {
                 let mut done = BOOL(0);
                 let data = Some((&raw mut done).cast());
-                if ctx.GetData(&self.converted.0, data, size_of::<BOOL>() as u32, 0).is_ok() && done.as_bool() {
-                    break;
+                unsafe {
+                    ctx.GetData(&self.converted.0, data, size_of::<BOOL>() as u32, 0)?;
                 }
-                thread::sleep(Duration::from_millis(1));
-            }
-        }
-        Ok(())
+                Ok(done.as_bool())
+            },
+            || thread::sleep(Duration::from_millis(1)),
+        )
     }
+}
+
+fn wait_for_conversion(
+    mut poll: impl FnMut() -> windows::core::Result<bool>,
+    mut wait: impl FnMut(),
+) -> windows::core::Result<()> {
+    const ATTEMPTS: usize = 500;
+    for attempt in 1..=ATTEMPTS {
+        if poll()? {
+            return Ok(());
+        }
+        if attempt < ATTEMPTS {
+            wait();
+        }
+    }
+    Err(HRESULT::from_win32(ERROR_TIMEOUT.0).into())
 }
 
 struct Inner {
@@ -298,8 +316,8 @@ impl Encoder {
         let (x, y, w, h) = rect;
         let canvas = &self.inner.canvas;
         let ctx = &canvas.context.0;
-        let mut overlay = self.overlay_texture.lock().unwrap();
         let _gpu = canvas.lock.lock().unwrap();
+        let mut overlay = self.overlay_texture.lock().unwrap();
         unsafe {
             if overlay.as_ref().is_none_or(|(_, r)| *r != rect) {
                 let desc = D3D11_TEXTURE2D_DESC {
@@ -588,6 +606,159 @@ fn encode_audio(inner: &Inner, aac: Com<Aac>, rx: Receiver<Vec<u8>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversion_waits_until_the_gpu_signals_ready() {
+        let mut results = [false, false, true].into_iter();
+        let mut waits = 0;
+        wait_for_conversion(|| Ok(results.next().unwrap()), || waits += 1).unwrap();
+        assert_eq!(waits, 2);
+        assert_eq!(results.next(), None);
+    }
+
+    #[test]
+    fn conversion_tolerates_a_delayed_gpu() {
+        let mut polls = 0;
+        let mut waits = 0;
+        wait_for_conversion(|| { polls += 1; Ok(polls > 80) }, || waits += 1).unwrap();
+        assert_eq!(polls, 81);
+        assert_eq!(waits, 80);
+    }
+
+    #[test]
+    fn conversion_returns_timeout_if_the_gpu_stays_pending() {
+        let mut polls = 0;
+        let mut waits = 0;
+        let error = wait_for_conversion(
+            || {
+                polls += 1;
+                Ok(false)
+            },
+            || waits += 1,
+        ).unwrap_err();
+        assert_eq!(error.code(), HRESULT::from_win32(ERROR_TIMEOUT.0));
+        assert_eq!(polls, 500);
+        assert_eq!(waits, 499);
+    }
+
+    #[test]
+    fn conversion_propagates_a_query_error_without_retrying() {
+        use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
+
+        let mut results = [Ok(false), Err(DXGI_ERROR_DEVICE_REMOVED.into())].into_iter();
+        let mut waits = 0;
+        let error = wait_for_conversion(|| results.next().unwrap(), || waits += 1).unwrap_err();
+        assert_eq!(error.code(), DXGI_ERROR_DEVICE_REMOVED);
+        assert_eq!(waits, 1);
+    }
+
+    #[test]
+    #[ignore]
+    fn selected_process_audio_reaches_recording_and_replay_without_desktop_capture() {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Child, Command, Stdio};
+        use std::time::Instant;
+        use crate::audio::{Input, InputKind, Mixer};
+        use crate::platform::audio::selected::{SelectedInput, SelectedProcess};
+        use wasapi::{DeviceEnumerator, Direction};
+        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+        use windows::Win32::Graphics::Direct3D11::{D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice};
+
+        struct Managed(Child);
+        impl Drop for Managed {
+            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        }
+        let output = std::path::PathBuf::from(std::env::var_os("OPNOVERLAY_SELECTED_E2E_DIR").unwrap());
+        std::fs::create_dir_all(&output).unwrap();
+        let devices = crate::platform::audio::list_devices(InputKind::System);
+        let endpoint = devices.iter().find(|device| device.name.contains("Steam Streaming Speakers")).unwrap();
+        let default_id = std::thread::spawn(|| {
+            wasapi::initialize_mta().ok().unwrap();
+            DeviceEnumerator::new().unwrap().get_default_device(&Direction::Render).unwrap().get_id().unwrap()
+        }).join().unwrap();
+        assert_ne!(endpoint.id, default_id);
+        let probe = Input::start(InputKind::System, Some(endpoint.id.clone()), 1.0, None);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(probe.shared.error().is_none());
+        assert!(probe.shared.peak() < 0.01);
+        let selected_marker = output.join("selected-marker");
+        let other_marker = output.join("other-marker");
+        let spawn = |marker: &Path| Managed(Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "win::player::tests::selected_audio_fixture_player", "--ignored", "--nocapture"])
+            .env("OPNOVERLAY_TEST_AUDIO_MARKER", marker)
+            .creation_flags(0x0000_0800)
+            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        let mut selected_child = spawn(&selected_marker);
+        let selected_process = Arc::new(SelectedProcess::open(selected_child.0.id()).unwrap());
+        let selected = SelectedInput::start(selected_process, 1.0, eframe::egui::Context::default()).unwrap();
+        let mut device = None;
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap();
+            D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, Default::default(), D3D11_CREATE_DEVICE_BGRA_SUPPORT, None, D3D11_SDK_VERSION, Some(&mut device), None, None).unwrap();
+        }
+        let outputs = Arc::new(Mutex::new(Outputs::default()));
+        let record = output.join("record.mp4");
+        {
+            let mut outputs = outputs.lock().unwrap();
+            outputs.start_file(record.clone());
+            outputs.set_replay(Some(45));
+        }
+        let clock = Arc::new(Clock::new());
+        let started = Arc::new(AtomicBool::new(false));
+        let encoder = Arc::new(Encoder::new(&device.unwrap(), EncoderSettings {
+            input: (320, 180), output: (320, 180), fps: 30, bitrate: 1_000_000,
+            audio: true, overlay: None,
+        }, clock.clone(), started.clone(), outputs.clone()).unwrap());
+        {
+            let canvas = &encoder.inner.canvas;
+            let _lock = canvas.lock.lock().unwrap();
+            unsafe { canvas.context.0.ClearRenderTargetView(&canvas.target.0, &[0.1, 0.2, 0.3, 1.0]); canvas.context.0.Flush(); }
+            canvas.ready.store(true, Ordering::Release);
+        }
+        let sink = encoder.clone();
+        let mixer = Mixer::start(vec![selected.shared.clone()], started, clock, move |pcm| sink.push_audio(pcm));
+        std::thread::sleep(Duration::from_secs(2));
+        {
+            let canvas = &encoder.inner.canvas;
+            let _lock = canvas.lock.lock().unwrap();
+            unsafe { canvas.context.0.ClearRenderTargetView(&canvas.target.0, &[0.8, 0.7, 0.6, 1.0]); canvas.context.0.Flush(); }
+        }
+        let mut other = spawn(&other_marker);
+        std::fs::write(&other_marker, b"go").unwrap();
+        let mut other_peak = 0.0f32;
+        let mut excluded_peak = 0.0f32;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            other_peak = other_peak.max(probe.shared.peak());
+            excluded_peak = excluded_peak.max(selected.shared.peak());
+            if other.0.try_wait().unwrap().is_some() { break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(other.0.wait().unwrap().success());
+        assert!(other_peak > 0.03 && excluded_peak < 0.01, "other={other_peak}, selected={excluded_peak}");
+        std::thread::sleep(Duration::from_secs(1));
+        std::fs::write(&selected_marker, b"go").unwrap();
+        let mut selected_peak = 0.0f32;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            selected_peak = selected_peak.max(selected.shared.peak());
+            if selected_child.0.try_wait().unwrap().is_some() { break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(selected_child.0.wait().unwrap().success());
+        assert!(selected_peak > 0.03, "selected process emitted no audio: {selected_peak}");
+        std::thread::sleep(Duration::from_secs(1));
+        drop(mixer);
+        let encoder = Arc::try_unwrap(encoder).ok().expect("encoder still shared");
+        let stats = encoder.stats();
+        let recording = encoder.finish().expect("no recording").finish().unwrap();
+        assert_eq!(recording, record);
+        let replay = outputs.lock().unwrap().replay().unwrap().save_unique(output.join("replay.mp4")).unwrap();
+        assert!(record.is_file() && replay.is_file());
+        assert!(!crate::mp4::repair(&record).unwrap());
+        assert!(!crate::mp4::repair(&replay).unwrap());
+        println!("record={}; replay={}; other={other_peak:.3}; excluded={excluded_peak:.3}; selected={selected_peak:.3}; encoded={}; lagged={}", record.display(), replay.display(), stats.0, stats.1);
+    }
 
     #[test]
     fn audio_queue_failure_is_reported_for_recording_and_replay() {

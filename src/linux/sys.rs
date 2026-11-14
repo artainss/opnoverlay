@@ -18,7 +18,9 @@ pub fn free_space(path: &Path) -> Option<u64> {
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 { return None; }
     let stats = unsafe { stats.assume_init() };
-    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+    #[allow(clippy::unnecessary_cast)]
+    let available = (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64);
+    Some(available)
 }
 
 /// No native handle is needed on Linux yet.

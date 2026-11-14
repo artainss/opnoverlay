@@ -20,7 +20,7 @@ pub fn trim(source: &Path, destination: &Path, start: i64, end: i64) -> Result<(
 
 fn pack_nv12_sample(sample: &windows::Win32::Media::MediaFoundation::IMFSample, width: u32, height: u32, stride: i32) -> Result<windows::Win32::Media::MediaFoundation::IMFSample, String> {
     use windows::Win32::Media::MediaFoundation::{MFCreateMemoryBuffer, MFCreateSample};
-    if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 || stride < width as i32 { return Err("Неподдерживаемый формат кадра.".into()); }
+    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) || stride < width as i32 { return Err("Неподдерживаемый формат кадра.".into()); }
     let pitch = stride as usize;
     let total = (width as usize).checked_mul(height as usize).and_then(|value| value.checked_mul(3)).map(|value| value / 2).ok_or("Слишком большой кадр.")?;
     let input = unsafe { sample.ConvertToContiguousBuffer() }.map_err(|e| e.to_string())?;
@@ -301,8 +301,9 @@ mod tests {
                     let buffer = sample.ConvertToContiguousBuffer().unwrap();
                     let (mut data, mut len) = (std::ptr::null_mut(), 0);
                     buffer.Lock(&mut data, None, Some(&mut len)).unwrap();
-                    for pair in std::slice::from_raw_parts(data, len as usize).chunks_exact(2) {
-                        peak = peak.max(i16::from_le_bytes([pair[0], pair[1]]).unsigned_abs() as i32);
+                    let (samples, _) = std::slice::from_raw_parts(data, len as usize).as_chunks::<2>();
+                    for &sample in samples {
+                        peak = peak.max(i16::from_le_bytes(sample).unsigned_abs() as i32);
                     }
                     buffer.Unlock().unwrap();
                 }

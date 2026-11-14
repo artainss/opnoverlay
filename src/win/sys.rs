@@ -276,6 +276,7 @@ pub fn show_in_folder(file: &Path) {
     let _ = Command::new("explorer").arg("/select,").arg(file).spawn();
 }
 
+#[allow(dead_code)]
 pub fn open_file(file: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::{PCWSTR, w};
@@ -361,11 +362,12 @@ fn startup_entry_at(key_path: windows::core::PCWSTR, value_name: windows::core::
     } else if query != ERROR_SUCCESS {
         return Err(crate::i18n::tr3!("No se pudo leer el inicio automático (código {}).", "Could not read startup entry (code {}).", "Не удалось прочитать автозапуск (код {}).", query.0));
     } else {
-        if kind != REG_SZ || size > 4096 || size % 2 != 0 { return Err(crate::i18n::tr3!("La entrada de inicio tiene un formato desconocido.", "The startup entry has an unknown format.", "Занята запись автозапуска с неизвестным форматом.").into()); }
+        if kind != REG_SZ || size > 4096 || !size.is_multiple_of(2) { return Err(crate::i18n::tr3!("La entrada de inicio tiene un formato desconocido.", "The startup entry has an unknown format.", "Занята запись автозапуска с неизвестным форматом.").into()); }
         let mut bytes = vec![0u8; size as usize];
         let query = unsafe { RegQueryValueExW(key.0, value_name, None, Some(&mut kind), Some(bytes.as_mut_ptr()), Some(&mut size)) };
-        if query != ERROR_SUCCESS || size as usize > bytes.len() || size % 2 != 0 { return Err(crate::i18n::tr3!("No se pudo leer la entrada de inicio.", "Could not read the startup entry.", "Не удалось прочитать запись автозапуска.").into()); }
-        let wide: Vec<u16> = bytes[..size as usize].chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        if query != ERROR_SUCCESS || size as usize > bytes.len() || !size.is_multiple_of(2) { return Err(crate::i18n::tr3!("No se pudo leer la entrada de inicio.", "Could not read the startup entry.", "Не удалось прочитать запись автозапуска.").into()); }
+        let (pairs, _) = bytes[..size as usize].as_chunks::<2>();
+        let wide: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
         Some(String::from_utf16(&wide).map_err(|_| crate::i18n::tr3!("Entrada de inicio no válida.", "Invalid startup entry.", "Некорректная запись автозапуска."))?.trim_end_matches('\0').to_owned())
     };
     if existing.as_ref().is_some_and(|value| !value.eq_ignore_ascii_case(&expected)) {

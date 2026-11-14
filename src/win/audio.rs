@@ -9,6 +9,8 @@ use wasapi::{AudioClient, DeviceEnumerator, Direction, SampleType, StreamMode, W
 
 use crate::audio::{CHANNELS, Device, InputKind, InputShared, SAMPLE_RATE};
 
+pub mod selected;
+
 fn direction(kind: InputKind) -> Direction {
     match kind {
         
@@ -41,7 +43,7 @@ pub fn capture(kind: InputKind, device_id: Option<&str>, shared: &InputShared) -
     let follows_default = device_id.is_none() && matches!(kind, InputKind::System | InputKind::Microphone);
     let mut opened = false;
     while !shared.stopped() {
-        match stream(kind, device_id, shared, follows_default, &mut opened) {
+        match stream(kind, device_id, shared, follows_default, &mut opened, |_| Ok(true)) {
             Ok(()) => {}
             Err(_) if follows_default && opened => {
                 
@@ -61,7 +63,17 @@ pub fn capture(kind: InputKind, device_id: Option<&str>, shared: &InputShared) -
 }
 
 
-fn stream(kind: InputKind, device_id: Option<&str>, shared: &InputShared, follows_default: bool, opened: &mut bool) -> Result<(), Box<dyn Error>> {
+fn stream(
+    kind: InputKind,
+    device_id: Option<&str>,
+    shared: &InputShared,
+    follows_default: bool,
+    opened: &mut bool,
+    mut valid: impl FnMut(bool) -> Result<bool, Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    if !valid(false)? {
+        return Ok(());
+    }
     let format = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE as usize, CHANNELS, None);
     let enumerator = DeviceEnumerator::new()?;
     let mut device_in_use = None;
@@ -87,13 +99,16 @@ fn stream(kind: InputKind, device_id: Option<&str>, shared: &InputShared, follow
         _ => None,
     };
     let capture = client.get_audiocaptureclient()?;
+    if !valid(false)? {
+        return Ok(());
+    }
     client.start_stream()?;
     *opened = true;
 
     let mut raw: VecDeque<u8> = VecDeque::new();
     let mut checked = Instant::now();
     let mut last_sound = Instant::now();
-    while !shared.stopped() {
+    while !shared.stopped() && valid(true)? {
         
         loop {
             let before = raw.len();
@@ -107,6 +122,9 @@ fn stream(kind: InputKind, device_id: Option<&str>, shared: &InputShared, follow
         }
         let usable = raw.len() / 4 * 4;
         if usable > 0 {
+            if !valid(true)? {
+                break;
+            }
             let bytes: Vec<u8> = raw.drain(..usable).collect();
             shared.deliver(bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect());
             last_sound = Instant::now();

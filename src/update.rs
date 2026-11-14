@@ -11,6 +11,7 @@ pub struct Release {
 
 /// The latest release, if it is newer than this build. Errors (no network, rate limit…) are
 /// returned so the caller can ignore them.
+#[allow(dead_code)]
 pub fn newer_release() -> Result<Option<Release>, String> {
     let json = crate::platform::sys::http_get(LATEST)?;
     let release = parse(&json).ok_or("unexpected response")?;

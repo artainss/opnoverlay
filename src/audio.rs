@@ -68,7 +68,7 @@ pub struct InputShared {
 }
 
 impl InputShared {
-    fn new(gain: f32, repaint: Option<eframe::egui::Context>) -> Self {
+    pub(crate) fn new(gain: f32, repaint: Option<eframe::egui::Context>) -> Self {
         Self {
             gain: AtomicU32::new(gain.to_bits()),
             peak: AtomicU32::new(0),
@@ -107,6 +107,17 @@ impl InputShared {
         self.stop.load(Ordering::Relaxed)
     }
 
+    #[cfg(windows)]
+    pub(crate) fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn discard_samples(&self) {
+        self.buffer.lock().unwrap().clear();
+        self.silent();
+    }
+
     
     pub(crate) fn deliver(&self, mut samples: Vec<f32>) {
         let mut denoiser = self.denoiser.lock().unwrap();
@@ -118,6 +129,9 @@ impl InputShared {
         drop(denoiser);
         let peak = samples.iter().fold(0f32, |p, s| p.max(s.abs()));
         let mut buf = self.buffer.lock().unwrap();
+        if self.stopped() {
+            return;
+        }
         buf.extend(samples);
         let excess = buf.len().saturating_sub(MAX_BUFFERED);
         buf.drain(..excess);
@@ -143,6 +157,10 @@ pub struct Input {
 }
 
 impl Input {
+    #[cfg(all(test, windows))]
+    pub(crate) fn synthetic(kind: InputKind) -> Self {
+        Self { kind, shared: Arc::new(InputShared::new(1.0, None)), thread: None }
+    }
     
     
     pub fn start(kind: InputKind, device_id: Option<String>, gain: f32, repaint: Option<eframe::egui::Context>) -> Self {
@@ -252,8 +270,11 @@ impl Mixer {
                             continue;
                         }
                         produced += frames as u64;
-                        let next = inputs.lock().unwrap().clone();
-                        if !same_inputs(&current, &next) {
+                        let changed = {
+                            let next = inputs.lock().unwrap();
+                            (!same_inputs(&current, &next)).then(|| next.clone())
+                        };
+                        if let Some(next) = changed {
                             for input in &next {
                                 if !current.iter().any(|old| Arc::ptr_eq(old, input)) {
                                     input.buffer.lock().unwrap().clear();
@@ -393,27 +414,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mixer_accepts_a_new_input_during_capture() {
+    fn mixer_adds_replaces_and_removes_an_input_during_capture() {
         let ready = Arc::new(AtomicBool::new(true));
         let clock = Arc::new(Clock::new());
         let (tx, rx) = std::sync::mpsc::channel();
         let mixer = Mixer::start(Vec::new(), ready, clock, move |pcm| { let _ = tx.send(pcm); });
-        let input = Arc::new(InputShared::new(1.0, None));
-        mixer.set_inputs(vec![input.clone()]);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut heard = false;
-        while Instant::now() < deadline {
-            input.deliver(vec![0.5; 960]);
-            if let Ok(pcm) = rx.recv_timeout(Duration::from_millis(30))
-                && pcm.chunks_exact(2).any(|s| i16::from_le_bytes([s[0], s[1]]).abs() > 1000)
-            {
-                heard = true;
-                break;
+        let first = Arc::new(InputShared::new(1.0, None));
+        let second = Arc::new(InputShared::new(1.0, None));
+        let wait_for_peak = |expected: i16| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut matches = 0;
+            while Instant::now() < deadline {
+                first.deliver(vec![0.25; 960]);
+                second.deliver(vec![0.5; 960]);
+                if let Ok(pcm) = rx.recv_timeout(Duration::from_millis(30)) {
+                    let peak = pcm.as_chunks::<2>().0.iter().map(|s| i16::from_le_bytes(*s)).max();
+                    if peak == Some(expected) {
+                        matches += 1;
+                        if matches == 3 {
+                            return;
+                        }
+                    } else {
+                        matches = 0;
+                    }
+                }
             }
-        }
-        assert!(heard);
+            panic!("mixer did not settle at peak {expected}");
+        };
+        mixer.set_inputs(vec![first.clone()]);
+        wait_for_peak((0.25 * i16::MAX as f32) as i16);
+        mixer.set_inputs(vec![second.clone()]);
+        wait_for_peak((0.5 * i16::MAX as f32) as i16);
         mixer.set_inputs(Vec::new());
-        drop(mixer);
+        wait_for_peak(0);
     }
 
     fn input_with(samples: &[f32], gain: f32) -> Arc<InputShared> {

@@ -180,7 +180,8 @@ fn encode_jpeg(path: &std::path::Path, width: u32, height: u32, rgba: &[u8], qua
     if width == 0 || height == 0 || rgba.len() != expected {
         return Err("Размер изображения не соответствует данным".into());
     }
-    let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]).collect();
+    let (pixels, _) = rgba.as_chunks::<4>();
+    let rgb: Vec<u8> = pixels.iter().flat_map(|&[r, g, b, _]| [r, g, b]).collect();
     let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
     let temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
     {

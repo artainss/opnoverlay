@@ -211,6 +211,8 @@ pub struct Config {
     pub mic_denoise: bool,
     /// Executable whose audio is captured on its own (Application Audio Capture).
     pub app_audio: Option<String>,
+    #[serde(default)]
+    pub selected_audio_only: bool,
     pub app_volume: f32,
     pub app_muted: bool,
     /// WASAPI endpoint IDs; `None` follows the Windows default device.
@@ -271,6 +273,7 @@ impl Default for Config {
             mic_muted: false,
             mic_denoise: false,
             app_audio: None,
+            selected_audio_only: false,
             app_volume: 1.0,
             app_muted: false,
             system_device: None,
@@ -326,10 +329,32 @@ impl Config {
     }
 
     pub fn save(&self) {
-        let Some(p) = path() else { return };
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = write_replacing(&p, json.as_bytes());
+        let _ = self.try_save();
+    }
+
+    pub fn try_save(&self) -> std::io::Result<()> {
+        let path = path().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "settings directory unavailable"))?;
+        let json = serde_json::to_string_pretty(self)?;
+        write_replacing(&path, json.as_bytes())
+    }
+
+    pub fn register_recording(&mut self, path: PathBuf) -> std::io::Result<()> {
+        self.pending_recoveries.push(path);
+        if let Err(error) = self.try_save() {
+            self.pending_recoveries.pop();
+            return Err(error);
         }
+        Ok(())
+    }
+
+    pub fn finish_recording(&mut self, path: &Path) -> bool {
+        let count = self.pending_recoveries.len();
+        self.pending_recoveries.retain(|item| item != path);
+        let was_legacy = self.last_recording.as_deref() == Some(path);
+        if was_legacy {
+            self.last_recording = None;
+        }
+        was_legacy || count != self.pending_recoveries.len()
     }
 }
 
@@ -370,6 +395,23 @@ fn try_lock(path: &Path) -> Option<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_registration_reports_a_save_failure_and_preserves_existing_entries() {
+        let mut config = Config::default();
+        let settings = path().unwrap();
+        let first = settings.with_file_name("first.mp4");
+        config.register_recording(first.clone()).unwrap();
+        let blocking_path = settings.with_extension("new");
+        fs::create_dir(&blocking_path).unwrap();
+        let second = settings.with_file_name("second.mp4");
+        assert!(config.register_recording(second.clone()).is_err());
+        assert_eq!(config.pending_recoveries, vec![first.clone()]);
+        assert_eq!(Config::load().pending_recoveries, vec![first.clone()]);
+        fs::remove_dir(&blocking_path).unwrap();
+        config.register_recording(second.clone()).unwrap();
+        assert_eq!(Config::load().pending_recoveries, vec![first, second]);
+    }
 
     #[test]
     #[ignore]
@@ -427,8 +469,10 @@ mod tests {
 
     #[test]
     fn migrates_only_the_previous_default_video_name() {
-        let mut config = Config::default();
-        config.video_name_template = "Видео [ГГГГ-ММ-ДД] [ЧЧ-ММ-СС]".into();
+        let mut config = Config {
+            video_name_template: "Видео [ГГГГ-ММ-ДД] [ЧЧ-ММ-СС]".into(),
+            ..Config::default()
+        };
         let parsed = Config::parse(&serde_json::to_string(&config).unwrap()).unwrap();
         assert_eq!(parsed.video_name_template, "[ГГГГ-ММ-ДД] [ЧЧ-ММ-СС] — Video");
         config.video_name_template = "[ГГГГ-ММ-ДД] [ЧЧ-ММ-СС] — Видео".into();

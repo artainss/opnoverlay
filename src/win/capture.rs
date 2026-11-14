@@ -63,30 +63,23 @@ fn prioritize_primary(sources: &mut [Source], primary: isize) {
     sources.sort_by_key(|source| source.id != SourceId::Monitor(primary));
 }
 
-#[cfg(test)]
-mod source_order_tests {
-    use super::*;
-
-    #[test]
-    fn primary_display_is_first_without_changing_labels() {
-        let mut sources = vec![
-            Source { id: SourceId::Monitor(10), label: "second".into() },
-            Source { id: SourceId::Monitor(20), label: "primary".into() },
-        ];
-        prioritize_primary(&mut sources, 20);
-        assert_eq!(sources[0].id, SourceId::Monitor(20));
-        assert_eq!(sources[0].label, "primary");
-        assert_eq!(sources[1].id, SourceId::Monitor(10));
-    }
-}
-
 /// Applications with a visible window (one entry per executable), excluding obs-lite.
 pub fn list_audio_apps() -> Vec<AudioApp> {
+    audio_apps(false)
+}
+
+pub fn list_audio_instances() -> Vec<AudioApp> {
+    audio_apps(true)
+}
+
+fn audio_apps(instances: bool) -> Vec<AudioApp> {
     let own_pid = std::process::id();
     let mut apps: Vec<AudioApp> = Vec::new();
     for w in Window::enumerate().unwrap_or_default() {
         let (Ok(title), Ok(pid), Ok(exe)) = (w.title(), w.process_id(), w.process_name()) else { continue };
-        if title.trim().is_empty() || pid == own_pid || cloaked(&w) || apps.iter().any(|a| a.exe.eq_ignore_ascii_case(&exe)) {
+        if title.trim().is_empty() || pid == own_pid || cloaked(&w)
+            || apps.iter().any(|a| if instances { a.pid == pid } else { a.exe.eq_ignore_ascii_case(&exe) })
+        {
             continue;
         }
         apps.push(AudioApp { pid, exe, title });
@@ -396,4 +389,70 @@ fn start_with_border(
         )),
     };
     result.map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod source_order_tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn capture_real_game_window_receives_frames() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        let expected = std::env::var("OPNOVERLAY_TEST_GAME_TITLE").unwrap();
+        let source = list_sources().into_iter().find(|source| matches!(source.id, SourceId::Window(_)) && source.label.contains(&expected)).expect("game window not listed");
+        let session = Session::start(SessionOptions { source: source.id, fps: 30, cursor: true, preview_fps: 0, record: Some(RecordConfig { quality: crate::config::Quality::Medium, custom_bitrate_mbps: 12, resolution: crate::config::Resolution::Native, audio: false, region: None, overlay: None }) }, None).expect("game capture failed to start");
+        let out = std::path::PathBuf::from(std::env::var_os("OPNOVERLAY_TEST_GAME_FILE").expect("test recording path missing"));
+        session.shared.outputs.lock().unwrap().start_file(out);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while session.shared.frames.load(Ordering::Relaxed) < 30 && Instant::now() < deadline && !session.is_finished() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_secs(3));
+        let (width, height, rgba) = session.snapshot().expect("screenshot failed");
+        let lit = rgba.chunks_exact(4).filter(|pixel| pixel[0] > 24 || pixel[1] > 24 || pixel[2] > 24).count();
+        println!("screenshot {width}x{height}; non-black pixels: {lit}");
+        assert!(lit > (width as usize * height as usize) / 100, "screenshot is black");
+        let frames = session.shared.frames.load(Ordering::Relaxed);
+        let (encoder, error) = session.stop();
+        assert!(frames >= 10, "game frames: {frames}, capture error: {error:?}");
+        encoder.expect("encoder missing").finish().expect("recording missing").finish().expect("cannot finalize recording");
+
+    }
+
+    #[test]
+    #[ignore]
+    fn replay_real_game_window() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        let expected = std::env::var("OPNOVERLAY_TEST_GAME_TITLE").unwrap();
+        let source = list_sources().into_iter().find(|source| matches!(source.id, SourceId::Window(_)) && source.label.contains(&expected)).expect("game window not listed");
+        let session = Session::start(SessionOptions { source: source.id, fps: 30, cursor: true, preview_fps: 0, record: Some(RecordConfig { quality: crate::config::Quality::Medium, custom_bitrate_mbps: 12, resolution: crate::config::Resolution::Native, audio: false, region: None, overlay: None }) }, None).expect("game capture failed");
+        session.shared.outputs.lock().unwrap().set_replay(Some(45));
+        let deadline = Instant::now() + Duration::from_secs(55);
+        while session.shared.frames.load(Ordering::Relaxed) < 30 && Instant::now() < deadline && !session.is_finished() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(session.shared.frames.load(Ordering::Relaxed) >= 30, "no game frames");
+        std::thread::sleep(Duration::from_secs(48));
+        let replay = session.shared.outputs.lock().unwrap().replay().expect("replay buffer unavailable");
+        let output = std::path::PathBuf::from(std::env::var_os("OPNOVERLAY_TEST_GAME_FILE").expect("replay output missing"));
+        let path = replay.save_unique(output).expect("failed to save replay");
+        println!("replay saved: {}", path.display());
+        let (_, error) = session.stop();
+        assert!(error.is_none(), "capture failed: {error:?}");
+    }
+
+    #[test]
+    fn primary_display_is_first_without_changing_labels() {
+        let mut sources = vec![
+            Source { id: SourceId::Monitor(10), label: "second".into() },
+            Source { id: SourceId::Monitor(20), label: "primary".into() },
+        ];
+        prioritize_primary(&mut sources, 20);
+        assert_eq!(sources[0].id, SourceId::Monitor(20));
+        assert_eq!(sources[0].label, "primary");
+        assert_eq!(sources[1].id, SourceId::Monitor(10));
+    }
 }

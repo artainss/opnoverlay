@@ -139,7 +139,8 @@ fn selftest(args: &[String]) -> Result<(), String> {
         shared.clock.clone(),
         move |mut pcm| {
             if synthetic_tone {
-                for frame in pcm.chunks_exact_mut(4) {
+                let (frames, _) = pcm.as_chunks_mut::<4>();
+                for frame in frames {
                     let phase = tone_frame as f64 * 440.0 * std::f64::consts::TAU / 48_000.0;
                     let sample = ((phase.sin() * 0.25) * f64::from(i16::MAX)) as i16;
                     frame[..2].copy_from_slice(&sample.to_le_bytes());

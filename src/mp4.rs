@@ -48,6 +48,7 @@ fn invalid(what: &str) -> io::Error {
 struct Header {
     start: u64,
     size: u64,
+    header_len: u64,
     kind: [u8; 4],
 }
 
@@ -57,28 +58,27 @@ impl Header {
         let mut head = [0u8; 8];
         r.read_exact(&mut head)?;
         let kind = [head[4], head[5], head[6], head[7]];
-        let size = match u32::from_be_bytes([head[0], head[1], head[2], head[3]]) {
-            0 => end - start,
+        let (size, header_len) = match u32::from_be_bytes([head[0], head[1], head[2], head[3]]) {
+            0 => (end.checked_sub(start).ok_or_else(|| invalid("bad box position"))?, 8),
             1 => {
                 let mut large = [0u8; 8];
                 r.read_exact(&mut large)?;
-                u64::from_be_bytes(large)
+                (u64::from_be_bytes(large), 16)
             }
-            n => u64::from(n),
+            n => (u64::from(n), 8),
         };
-        if size < 8 {
+        if size < header_len {
             return Err(invalid("bad box size"));
         }
-        if start + size > end {
+        if start.checked_add(size).is_none_or(|box_end| box_end > end) {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "box past the end of the file"));
         }
-        Ok(Self { start, size, kind })
+        Ok(Self { start, size, header_len, kind })
     }
 
     fn read_body(&self, r: &mut (impl Read + Seek)) -> io::Result<Vec<u8>> {
-        let header = if self.size > u64::from(u32::MAX) { 16 } else { 8 };
-        r.seek(SeekFrom::Start(self.start + header))?;
-        let mut body = vec![0; (self.size - header) as usize];
+        r.seek(SeekFrom::Start(self.start + self.header_len))?;
+        let mut body = vec![0; (self.size - self.header_len) as usize];
         r.read_exact(&mut body)?;
         Ok(body)
     }
@@ -470,6 +470,19 @@ fn pad(file: &mut impl Storage, boxes: &[Header], init: &Header) -> io::Result<(
     file.flush()
 }
 
+fn has_video_samples(moov: &[Node]) -> bool {
+    find(moov, b"mvex").is_none() && moov.iter().any(|node| {
+        let Node::Container(kind, track) = node else { return false };
+        if kind != b"trak" { return false; }
+        let Ok(media) = children(track, b"mdia") else { return false };
+        if leaf(media, b"hdlr").ok().and_then(|body| body.get(8..12)) != Some(b"vide") {
+            return false;
+        }
+        let Ok(table) = children(media, b"minf").and_then(|minf| children(minf, b"stbl")) else { return false };
+        [b"stsz", b"stz2"].into_iter().any(|kind| leaf(table, kind).and_then(|body| u32_at(body, 8)).is_ok_and(|count| count > 0))
+    })
+}
+
 fn convert(file: &mut impl Storage, cut_short: bool) -> io::Result<bool> {
     let len = file.seek(SeekFrom::End(0))?;
     let mut top = Vec::new();
@@ -485,6 +498,21 @@ fn convert(file: &mut impl Storage, cut_short: bool) -> io::Result<bool> {
         }
     }
     if !top.iter().any(|h| &h.kind == b"moof") {
+        if cut_short {
+            if end != len || !top.iter().any(|h| &h.kind == b"mdat" && h.size > h.header_len) {
+                return Err(invalid("no complete video data"));
+            }
+            let index = top.iter().rfind(|h| &h.kind == b"moov").ok_or_else(|| invalid("no moov"))?;
+            if !has_video_samples(&parse(&index.read_body(file)?)?) {
+                return Err(invalid("no indexed video samples"));
+            }
+            if let Some(init) = top.iter().find(|h| &h.kind == b"moov" && h.start < index.start)
+                && find(&parse(&init.read_body(file)?)?, b"mvex").is_some()
+            {
+                pad(file, &top, init)?;
+                return Ok(true);
+            }
+        }
         return Ok(false);
     }
     let init_header = top.iter().find(|h| &h.kind == b"moov").ok_or_else(|| invalid("no moov"))?;
@@ -492,7 +520,9 @@ fn convert(file: &mut impl Storage, cut_short: bool) -> io::Result<bool> {
     // wrote the full index after the fragments: only the padding is left to do, rather than
     // adding a second index made from the fragments not yet marked.
     let first_moof = top.iter().position(|h| &h.kind == b"moof").expect("checked above");
-    let indexed = top[first_moof..].iter().any(|h| &h.kind == b"moov" && h.read_body(file).is_ok_and(|b| parse(&b).is_ok()));
+    let indexed = top[first_moof..].iter().any(|h| {
+        &h.kind == b"moov" && h.read_body(file).and_then(|b| parse(&b)).is_ok_and(|moov| has_video_samples(&moov))
+    });
     if indexed {
         pad(file, &top, init_header)?;
         return Ok(true);
@@ -541,6 +571,9 @@ fn convert(file: &mut impl Storage, cut_short: bool) -> io::Result<bool> {
         }
     }
     let index = full_index(init, &tracks)?;
+    if cut_short && !has_video_samples(children(&parse(&index)?, b"moov")?) {
+        return Err(invalid("no complete video fragment"));
+    }
 
     // The new index goes where the fragment index (`mfra`) was, or at the end; the old indexes
     // become padding last, so the file plays at every step.
@@ -561,6 +594,44 @@ pub(crate) mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    #[test]
+    fn oversized_extended_box_is_rejected_without_overflow() {
+        let mut data = vec![0];
+        data.extend_from_slice(&1u32.to_be_bytes());
+        data.extend_from_slice(b"free");
+        data.extend_from_slice(&u64::MAX.to_be_bytes());
+        let end = data.len() as u64;
+        let result = Header::read(&mut Cursor::new(data), 1, end);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn extended_box_reads_payload_and_rejects_short_header() {
+        let mut data = 1u32.to_be_bytes().to_vec();
+        data.extend_from_slice(b"free");
+        data.extend_from_slice(&20u64.to_be_bytes());
+        data.extend_from_slice(b"data");
+        let mut cursor = Cursor::new(data);
+        let header = Header::read(&mut cursor, 0, 20).unwrap();
+        assert_eq!(header.read_body(&mut cursor).unwrap(), b"data");
+        cursor.get_mut()[8..16].copy_from_slice(&12u64.to_be_bytes());
+        assert!(Header::read(&mut cursor, 0, 20).is_err());
+    }
+
+    #[test]
+    fn recovery_leaves_invalid_extended_box_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("broken.mp4");
+        let mut original = 8u32.to_be_bytes().to_vec();
+        original.extend_from_slice(b"ftyp");
+        original.extend_from_slice(&1u32.to_be_bytes());
+        original.extend_from_slice(b"free");
+        original.extend_from_slice(&u64::MAX.to_be_bytes());
+        std::fs::write(&path, &original).unwrap();
+        assert!(repair(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
 
     #[test]
     #[ignore]
@@ -887,11 +958,28 @@ pub(crate) mod tests {
 
     #[test]
     fn a_regular_file_is_left_alone() {
-        let regular = [bx(b"ftyp", b"mp42\0\0\0\0mp41isom"), bx(b"mdat", &[1; 50]), bx(b"moov", &[])].concat();
+        let (fragmented, video, audio) = fragmented();
+        let regular = converted(fragmented, false).unwrap();
+        assert_regular(&regular, &video, &audio);
         let mut file = Logged { file: Cursor::new(regular.clone()), log: Vec::new(), writes_left: usize::MAX };
         assert!(!convert(&mut file, true).unwrap());
         assert!(file.log.is_empty(), "untouched: {:?}", file.log);
         assert_eq!(file.file.into_inner(), regular);
+    }
+
+    #[test]
+    fn files_without_a_complete_video_fragment_are_rejected_unchanged() {
+        let (fragmented, _, _) = fragmented();
+        let boxes = top_level(&fragmented);
+        let first_moof = boxes.iter().find(|(_, kind)| kind == b"moof").unwrap().0 as usize;
+        let first_mdat = boxes.iter().find(|(_, kind)| kind == b"mdat").unwrap().0 as usize;
+        for cut in [0, 6, first_moof, first_moof + 4, first_mdat + 9] {
+            let original = fragmented[..cut].to_vec();
+            let mut file = Logged { file: Cursor::new(original.clone()), log: Vec::new(), writes_left: usize::MAX };
+            assert_eq!(convert(&mut file, true).expect_err(&format!("cut at byte {cut}")).kind(), io::ErrorKind::InvalidData);
+            assert!(file.log.is_empty());
+            assert_eq!(file.file.into_inner(), original);
+        }
     }
 
     #[test]
@@ -907,12 +995,13 @@ pub(crate) mod tests {
     #[test]
     fn a_conversion_stopped_halfway_is_finished_with_one_index() {
         let (original, video, audio) = fragmented();
-        // Stopped after the new index and the first padding mark.
-        let mut file = Logged { file: Cursor::new(original), log: Vec::new(), writes_left: 2 };
-        assert!(convert(&mut file, false).is_err());
-        assert_eq!(file.log.iter().filter(|&&op| op == "pad").count(), 1);
-        // Repaired at the next start.
-        assert_regular(&converted(file.file.into_inner(), true).unwrap(), &video, &audio);
+        for padded in [1, 3] {
+            let mut file = Logged { file: Cursor::new(original.clone()), log: Vec::new(), writes_left: 1 + padded };
+            assert!(convert(&mut file, false).is_err());
+            assert_eq!(file.log.iter().filter(|&&op| op == "pad").count(), padded);
+            assert!(convert(&mut file, true).unwrap_err().to_string().contains("stopped"));
+            assert_regular(&converted(file.file.into_inner(), true).unwrap(), &video, &audio);
+        }
     }
 
     #[test]

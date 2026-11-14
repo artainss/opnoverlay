@@ -1,7 +1,7 @@
 use std::path::Path;
 use windows::core::{PCWSTR, w};
 use windows::Win32::Foundation::HWND;
-use windows::Win32::Media::MediaFoundation::{IMFPMediaPlayer, IMFPMediaPlayerCallback, MFPCreateMediaPlayer, MFP_CREATION_OPTIONS, MFP_MEDIAPLAYER_STATE_PAUSED, MFP_MEDIAPLAYER_STATE_PLAYING, MFP_POSITIONTYPE_100NS};
+use windows::Win32::Media::MediaFoundation::{IMFPMediaPlayer, IMFPMediaPlayerCallback, MFPCreateMediaPlayer, MFP_CREATION_OPTIONS, MFP_MEDIAPLAYER_STATE_PLAYING, MFP_POSITIONTYPE_100NS};
 use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PropVariantClear, PropVariantToInt64};
 use windows::Win32::System::Variant::VT_I8;
 use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER, WINDOW_EX_STYLE, WS_CHILD, WS_CLIPSIBLINGS, WS_VISIBLE};
@@ -52,7 +52,6 @@ impl Player {
         unsafe {
             let state = self.player.GetState().map_err(|e| e.to_string())?;
             if state == MFP_MEDIAPLAYER_STATE_PLAYING { self.player.Pause() }
-            else if state == MFP_MEDIAPLAYER_STATE_PAUSED { self.player.Play() }
             else { self.player.Play() }
         }.map_err(|e| e.to_string())
     }
@@ -149,6 +148,150 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn selected_audio_fixture_player() {
+        use windows::core::HSTRING;
+        use windows::Win32::Media::MediaFoundation::{MFCreateAudioRendererActivate, MFCreateSourceReaderFromURL, MFMediaType_Audio, MF_AUDIO_RENDERER_ATTRIBUTE_ENDPOINT_ID, MF_AUDIO_RENDERER_ATTRIBUTE_FLAGS, MF_AUDIO_RENDERER_ATTRIBUTE_FLAGS_NOPERSIST, MF_MT_MAJOR_TYPE};
+
+        let Some(marker) = std::env::var_os("OPNOVERLAY_TEST_AUDIO_MARKER") else { return };
+        let marker = std::path::PathBuf::from(marker);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !marker.exists() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(10)); }
+        assert!(marker.exists());
+        let path = std::path::PathBuf::from(std::env::var_os("OPNOVERLAY_CHECK_FILE").unwrap());
+        let devices = crate::platform::audio::list_devices(crate::audio::InputKind::System);
+        let endpoint = devices.iter().find(|device| device.name.contains("Steam Streaming Speakers")).unwrap();
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+            let mut player = None;
+            MFPCreateMediaPlayer(PCWSTR::null(), false, MFP_CREATION_OPTIONS(0), None::<&IMFPMediaPlayerCallback>, None, Some(&mut player)).unwrap();
+            let player = player.unwrap();
+            let mut item = None;
+            player.CreateMediaItemFromURL(PCWSTR(wide.as_ptr()), true, 0, Some(&mut item)).unwrap();
+            let item = item.unwrap();
+            let reader = MFCreateSourceReaderFromURL(PCWSTR(wide.as_ptr()), None).unwrap();
+            let mut audio_index = None;
+            for index in 0..item.GetNumberOfStreams().unwrap() {
+                let media_type = reader.GetNativeMediaType(index, 0).unwrap();
+                if media_type.GetGUID(&MF_MT_MAJOR_TYPE).unwrap() == MFMediaType_Audio { audio_index = Some(index); }
+                else { item.SetStreamSelection(index, false).unwrap(); }
+            }
+            let activate = MFCreateAudioRendererActivate().unwrap();
+            activate.SetString(&MF_AUDIO_RENDERER_ATTRIBUTE_ENDPOINT_ID, &HSTRING::from(&endpoint.id)).unwrap();
+            activate.SetUINT32(&MF_AUDIO_RENDERER_ATTRIBUTE_FLAGS, MF_AUDIO_RENDERER_ATTRIBUTE_FLAGS_NOPERSIST).unwrap();
+            item.SetStreamSink(audio_index.unwrap(), &activate).unwrap();
+            player.SetMediaItem(&item).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut message = MSG::default();
+            while player.GetState().ok() != Some(MFP_MEDIAPLAYER_STATE_STOPPED) && Instant::now() < deadline {
+                while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(player.GetState().unwrap(), MFP_MEDIAPLAYER_STATE_STOPPED);
+            player.Play().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            player.Shutdown().unwrap();
+            drop(reader);
+            drop(item);
+            drop(player);
+            CoUninitialize();
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn selected_process_excludes_a_separate_process_on_virtual_audio_device() {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Child, Command, Stdio};
+        use crate::platform::audio::selected::{CaptureState, SelectedInput, SelectedProcess};
+        use crate::audio::{Input, InputKind};
+        use wasapi::{DeviceEnumerator, Direction};
+
+        struct Managed(Child);
+        impl Drop for Managed {
+            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        }
+        let devices = crate::platform::audio::list_devices(InputKind::System);
+        let endpoint = devices.iter().find(|device| device.name.contains("Steam Streaming Speakers")).unwrap();
+        let default_id = std::thread::spawn(|| {
+            wasapi::initialize_mta().ok().unwrap();
+            DeviceEnumerator::new().unwrap().get_default_device(&Direction::Render).unwrap().get_id().unwrap()
+        }).join().unwrap();
+        assert_ne!(endpoint.id, default_id);
+        let probe = Input::start(InputKind::System, Some(endpoint.id.clone()), 1.0, None);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(probe.shared.error().is_none());
+        assert!(probe.shared.peak() < 0.01);
+        let dir = tempfile::tempdir().unwrap();
+        let selected_marker = dir.path().join("selected");
+        let other_marker = dir.path().join("other");
+        let spawn = |marker: &Path| Managed(Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "win::player::tests::selected_audio_fixture_player", "--ignored", "--nocapture"])
+            .env("OPNOVERLAY_TEST_AUDIO_MARKER", marker)
+            .creation_flags(0x0000_0800)
+            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        let mut selected_child = spawn(&selected_marker);
+        let selected_process = std::sync::Arc::new(SelectedProcess::open(selected_child.0.id()).unwrap());
+        let selected = SelectedInput::start(selected_process, 1.0, eframe::egui::Context::default()).unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        let mut other = spawn(&other_marker);
+        std::fs::write(&other_marker, b"go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut other_peak = 0.0f32;
+        let mut excluded_peak = 0.0f32;
+        while Instant::now() < deadline {
+            other_peak = other_peak.max(probe.shared.peak());
+            excluded_peak = excluded_peak.max(selected.shared.peak());
+            if other.0.try_wait().unwrap().is_some() { break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(other.0.wait().unwrap().success());
+        assert!(other_peak > 0.03, "other process did not emit audio: {other_peak}");
+        assert!(excluded_peak < 0.01, "other process leaked into selected stream: {excluded_peak}");
+        std::fs::write(&selected_marker, b"go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut selected_peak = 0.0f32;
+        while Instant::now() < deadline {
+            selected_peak = selected_peak.max(selected.shared.peak());
+            if selected_child.0.try_wait().unwrap().is_some() { break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(selected_child.0.wait().unwrap().success());
+        assert!(selected_peak > 0.03, "selected process emitted no audio: {selected_peak}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while selected.state() != CaptureState::Exited && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(selected.state(), CaptureState::Exited);
+        let restarted_marker = dir.path().join("restarted");
+        let mut restarted = spawn(&restarted_marker);
+        std::fs::write(&restarted_marker, b"go").unwrap();
+        let mut restarted_peak = 0.0f32;
+        let mut after_exit_peak = 0.0f32;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            restarted_peak = restarted_peak.max(probe.shared.peak());
+            after_exit_peak = after_exit_peak.max(selected.shared.peak());
+            if restarted.0.try_wait().unwrap().is_some() { break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(restarted.0.wait().unwrap().success());
+        assert!(restarted_peak > 0.03 && after_exit_peak < 0.01, "restarted={restarted_peak}, selected={after_exit_peak}");
+        println!("other={other_peak:.3}; excluded={excluded_peak:.3}; selected={selected_peak:.3}; restarted={restarted_peak:.3}; after_exit={after_exit_peak:.3}");
+    }
+
+    #[test]
+    #[ignore]
     fn playback_emits_audio_to_an_isolated_virtual_endpoint() {
         use windows::core::HSTRING;
         use windows::Win32::Media::MediaFoundation::{MFCreateAudioRendererActivate, MFCreateSourceReaderFromURL, MFMediaType_Audio, MF_AUDIO_RENDERER_ATTRIBUTE_ENDPOINT_ID, MF_AUDIO_RENDERER_ATTRIBUTE_FLAGS, MF_AUDIO_RENDERER_ATTRIBUTE_FLAGS_NOPERSIST, MF_MT_MAJOR_TYPE};
@@ -167,6 +310,11 @@ mod tests {
         };
         assert_ne!(endpoint.id, default_id, "test endpoint must not be the system default");
         let capture = Input::start(InputKind::System, Some(endpoint.id.clone()), 1.0, None);
+        let selected = crate::platform::audio::selected::SelectedInput::start(
+            std::sync::Arc::new(crate::platform::audio::selected::SelectedProcess::open(std::process::id()).unwrap()),
+            1.0,
+            eframe::egui::Context::default(),
+        ).unwrap();
         std::thread::sleep(Duration::from_millis(500));
         assert!(capture.shared.error().is_none(), "capture error: {:?}", capture.shared.error());
         assert!(capture.shared.peak() < 0.01, "virtual endpoint is already in use");
@@ -205,12 +353,14 @@ mod tests {
             player.Play().unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut peak = 0.0f32;
+            let mut selected_peak = 0.0f32;
             while Instant::now() < deadline {
                 while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
                     let _ = TranslateMessage(&message);
                     DispatchMessageW(&message);
                 }
                 peak = peak.max(capture.shared.peak());
+                selected_peak = selected_peak.max(selected.shared.peak());
                 std::thread::sleep(Duration::from_millis(10));
             }
             player.Shutdown().unwrap();
@@ -219,7 +369,8 @@ mod tests {
             drop(player);
             CoUninitialize();
             assert!(peak > 0.03, "virtual output contained no expected audio, peak={peak}");
-            println!("virtual playback peak={peak:.3}");
+            assert!(selected_peak > 0.03, "selected process loopback contained no expected audio, peak={selected_peak}");
+            println!("virtual playback peak={peak:.3}; selected process peak={selected_peak:.3}");
         }
     }
 

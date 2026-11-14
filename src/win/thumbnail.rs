@@ -25,7 +25,8 @@ pub fn load(path: &Path) -> Option<ColorImage> {
                 let rows = GetDIBits(dc, bitmap, 0, height as u32, Some(pixels.as_mut_ptr().cast()), &mut format, DIB_RGB_COLORS);
                 ReleaseDC(None, dc);
                 if rows == height as i32 {
-                    for pixel in pixels.chunks_exact_mut(4) { pixel.swap(0, 2); pixel[3] = 255; }
+                    let (rgba, _) = pixels.as_chunks_mut::<4>();
+                    for pixel in rgba { pixel.swap(0, 2); pixel[3] = 255; }
                     Some(ColorImage::from_rgba_unmultiplied([width, height], &pixels))
                 } else { None }
             } else { None };

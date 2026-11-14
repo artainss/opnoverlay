@@ -7,9 +7,10 @@ $ErrorActionPreference = 'Stop'
 
 $root = Split-Path $PSScriptRoot
 if (-not $Version) {
-    $Version = (Select-String -Path (Join-Path $root 'Cargo.toml') -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+    $Version = (Select-String -LiteralPath (Join-Path $root 'Cargo.toml') -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
 }
-$icon = Get-ChildItem (Join-Path $root 'target\release\build\opnoverlay-*\out\icon.ico') |
+$icon = Get-ChildItem -LiteralPath (Join-Path $root 'target\release\build') -Directory -Filter 'opnoverlay-*' -ErrorAction SilentlyContinue |
+    ForEach-Object { Get-Item -LiteralPath (Join-Path $_.FullName 'out\icon.ico') -ErrorAction SilentlyContinue } |
     Sort-Object LastWriteTime | Select-Object -Last 1
 if (-not $icon) { throw 'icon.ico not found: run cargo build --release first' }
 
