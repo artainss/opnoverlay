@@ -24,6 +24,7 @@ use crate::platform::encoder::{Encoder, PendingFile};
 use crate::config::{Config, Hotkeys, HudCorner, HudSize, ProfileSource, Quality, RecordingProfile, Region, ReplayStorage, Resolution, ScreenshotFormat};
 use crate::hotkeys::{self, Binding, GlobalHotkeys};
 use crate::i18n::{self, Language, tr, tr3};
+use crate::storage::LocalTime;
 use crate::tray::{Tray, TrayCommand, TrayState};
 use crate::update::Release;
 
@@ -573,13 +574,16 @@ impl App {
                     .find(|id| capture::display_key(*id).is_some_and(|key| key.eq_ignore_ascii_case(wanted)));
                 return;
             }
-            let wanted = self.config.source_label.as_deref();
-            self.selected = self
-                .sources
-                .iter()
-                .find(|s| Some(s.label.as_str()) == wanted)
-                .or_else(|| self.sources.first())
-                .map(|s| s.id);
+            #[cfg(windows)]
+            {
+                self.selected = restored_source(&self.sources, self.config.source_label.as_deref());
+            }
+            #[cfg(not(windows))]
+            {
+                let wanted = self.config.source_label.as_deref();
+                self.selected = self.sources.iter().find(|source| Some(source.label.as_str()) == wanted)
+                    .or_else(|| self.sources.first()).map(|source| source.id);
+            }
         }
     }
 
@@ -861,7 +865,7 @@ impl App {
     }
 
     fn start_recording(&mut self, ctx: &egui::Context) {
-        let stem = match video_name(&self.config.video_name_template, chrono::Local::now().naive_local()) {
+        let stem = match video_name(&self.config.video_name_template, LocalTime::now()) {
             Ok(name) => name,
             Err(error) => return self.set_status(tr3!("Plantilla de nombre de vídeo no válida: {}", "Invalid video name template: {}", "Неверный шаблон имени видео: {}", error), None, true),
         };
@@ -975,7 +979,7 @@ impl App {
             RecState::Idle => {}
         }
         let Some(source) = self.selected else {
-            self.set_status(tr!("Añade una fuente con el botón + del panel Fuentes.", "Add a source with the + button in the Sources dock."), None, true);
+            self.set_status(tr3!("Elige una fuente en Ajustes → Vídeo.", "Choose a capture source in Settings → Video.", "Выберите источник в настройках видео."), None, true);
             return false;
         };
         // One capture session at a time: the recording session also feeds the preview.
@@ -1553,7 +1557,9 @@ impl App {
             self.trim_frames.clear();
             self.trim_loading = None;
             self.trim_requested = false;
-            self.trim_error = None;
+            self.trim_error = player.seek(0.0).and_then(|()| {
+                if player.playing() { Ok(()) } else { player.toggle() }
+            }).err();
         } else if show_folder {
             crate::platform::sys::show_in_folder(&file_path);
             self.hide_window(ui.ctx());
@@ -3461,7 +3467,7 @@ impl App {
                 if replay_duration.is_none() {
                     ui.colored_label(RED, text("Длительность отката: укажите время от 00:01 до 1440:00.", "Replay duration must be between 00:01 and 1440:00.", "La duración debe estar entre 00:01 y 1440:00."));
                 }
-                let name_error = video_name(&dialog.draft.video_name_template, chrono::Local::now().naive_local()).err();
+                let name_error = video_name(&dialog.draft.video_name_template, LocalTime::now()).err();
                 if let Some(error) = &name_error {
                     ui.colored_label(RED, format!("{}: {error}", text("Шаблон имени", "Name template", "Plantilla de nombre")));
                 }
@@ -3827,6 +3833,26 @@ fn profile_source(source: &Source) -> Option<ProfileSource> {
         return Some(ProfileSource::Display(key));
     }
     matches!(source.id, SourceId::Window(_)).then(|| ProfileSource::Window(source.label.clone()))
+}
+
+#[cfg(windows)]
+fn restored_source(sources: &[Source], wanted: Option<&str>) -> Option<SourceId> {
+    let Some(wanted) = wanted else { return sources.first().map(|source| source.id); };
+    let mut matches = sources.iter().filter(|source| source.label == wanted);
+    let source = matches.next()?;
+    matches.next().is_none().then_some(source.id)
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn missing_or_ambiguous_saved_window_does_not_select_a_different_source() {
+    let screen = Source { id: SourceId::Monitor(1), label: "Display 1".into() };
+    let game = Source { id: SourceId::Window(2), label: "Game — game.exe".into() };
+    let duplicate = Source { id: SourceId::Window(3), label: game.label.clone() };
+    assert_eq!(restored_source(std::slice::from_ref(&screen), Some(&game.label)), None);
+    assert_eq!(restored_source(&[screen.clone(), game.clone()], Some(&game.label)), Some(game.id));
+    assert_eq!(restored_source(&[screen.clone(), game.clone(), duplicate], Some(&game.label)), None);
+    assert_eq!(restored_source(&[screen.clone(), game], None), Some(screen.id));
 }
 
 fn recording_profiles(ui: &mut egui::Ui, config: &mut Config, duration: &mut String, selected: &mut Option<SourceId>, sources: &[Source], language: Language) {
@@ -4344,11 +4370,11 @@ fn validate_file_stem(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn video_name(template: &str, time: chrono::NaiveDateTime) -> Result<String, String> {
+fn video_name(template: &str, time: LocalTime) -> Result<String, String> {
     let name = template
-        .replace("[ГГГГ-ММ-ДД]", &time.format("%Y-%m-%d").to_string())
-        .replace("[ЧЧ-ММ-СС]", &time.format("%H-%M-%S").to_string())
-        .replace("[ЧЧ-ММ]", &time.format("%H-%M").to_string());
+        .replace("[ГГГГ-ММ-ДД]", &time.date())
+        .replace("[ЧЧ-ММ-СС]", &time.time(true))
+        .replace("[ЧЧ-ММ]", &time.time(false));
     if name.contains(['[', ']']) { return Err(tr3!("Marcador de fecha u hora desconocido.", "Unknown date or time placeholder.", "Неизвестное обозначение даты или времени.").into()); }
     validate_file_stem(&name)?;
     Ok(name)
@@ -4533,13 +4559,13 @@ fn repaint_interval(hidden: bool, active: bool, meters: &[f32]) -> Duration {
     if !hidden && (active || meters.iter().any(|m| *m > METER_FLOOR)) { Duration::from_millis(66) } else { Duration::from_secs(1) }
 }
 
-fn dated_media_stem(label: Option<&str>, time: chrono::NaiveDateTime) -> String {
-    let time = time.format("%Y-%m-%d %H-%M-%S%.3f");
-    label.map_or_else(|| time.to_string(), |label| format!("{time} — {label}"))
+fn dated_media_stem(label: Option<&str>, time: LocalTime) -> String {
+    let stem = format!("{} {}.{:03}", time.date(), time.time(true), time.millis);
+    if let Some(label) = label { format!("{stem} — {label}") } else { stem }
 }
 
 fn new_output(dir: &Path, prefix: Option<&str>, ext: &str, named: &mut HashSet<PathBuf>) -> PathBuf {
-    let stem = dated_media_stem(prefix, chrono::Local::now().naive_local());
+    let stem = dated_media_stem(prefix, LocalTime::now());
     unused_name(dir, &stem, ext, named)
 }
 
@@ -7795,8 +7821,8 @@ mod tests {
 
     #[test]
     fn dated_media_names_sort_oldest_to_newest_and_identify_kind() {
-        let earlier = chrono::NaiveDate::from_ymd_opt(2026, 11, 12).unwrap().and_hms_milli_opt(10, 20, 0, 5).unwrap();
-        let later = earlier + chrono::Duration::milliseconds(1);
+        let earlier = LocalTime { year: 2026, month: 11, day: 12, hour: 10, minute: 20, second: 0, millis: 5 };
+        let later = LocalTime { millis: 6, ..earlier };
         let first = dated_media_stem(Some("Replay"), earlier);
         let second = dated_media_stem(Some("Replay"), later);
         let screenshot = dated_media_stem(Some("Screenshot"), later);
@@ -7849,7 +7875,7 @@ mod tests {
 
     #[test]
     fn video_template_formats_time_and_rejects_invalid_names() {
-        let time = chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap().and_hms_opt(9, 5, 7).unwrap();
+        let time = LocalTime { year: 2026, month: 11, day: 1, hour: 9, minute: 5, second: 7, millis: 0 };
         assert_eq!(video_name("Видео [ГГГГ-ММ-ДД] [ЧЧ-ММ]", time).unwrap(), "Видео 2026-11-01 09-05");
         assert_eq!(video_name("[ЧЧ-ММ-СС]", time).unwrap(), "09-05-07");
         for bad in ["", "../файл", "NUL", "видео [НЕИЗВЕСТНО]", "видео:"] {

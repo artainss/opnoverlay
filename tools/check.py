@@ -88,6 +88,8 @@ def smoke(env, args):
             flags.append("dxgi")
         if args.separate_audio:
             flags.append("separate-audio")
+        if args.window_title:
+            flags.append(f"window-title={args.window_title}")
         run(executable, "--selftest", str(args.seconds), recording, *flags, env=test_env,
             timeout=args.seconds + 25)
         width, height = png_dimensions(screenshot)
@@ -161,6 +163,7 @@ def main():
     capture.add_argument("--light-profile", action="store_true", help="Use the 720p / 30 FPS light profile.")
     capture.add_argument("--dxgi", action="store_true", help="Use DXGI Desktop Duplication for the monitor capture.")
     capture.add_argument("--separate-audio", action="store_true", help="Verify the mix, game, and microphone tracks.")
+    capture.add_argument("--window-title", help="Capture the single window whose title contains this text.")
     capture.add_argument("--save-screenshot", type=Path, help="Keep the screenshot at a new path.")
     media = commands.add_parser("media", help="Decode an existing MP4 and check its video and audio.")
     media.add_argument("path", type=Path)

@@ -1,6 +1,6 @@
 [package]
 name = "opnoverlay"
-version = "0.9.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Lightweight Windows recording overlay"
@@ -10,7 +10,6 @@ license = "MIT"
 visual-test = []
 
 [dependencies]
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs = "7.0.0"
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }

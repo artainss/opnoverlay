@@ -2,7 +2,16 @@
 
 [Русский](README.md) | **English**
 
-A personal Windows overlay written in Rust for screen recording, instant replays, screenshots, and audio controls.
+A Windows game overlay written in Rust. Save the last few seconds, record video and audio, take screenshots, and review or trim clips directly in the overlay.
+
+## Installation
+
+Download the MSI or portable ZIP from the [release page](https://github.com/artainss/opnoverlay/releases/latest). The MSI upgrades an existing installation and keeps your settings and gallery. For portable use, extract all files to a writable folder and launch `opnoverlay.exe`. SHA-256 checksums are provided for both packages.
+
+- **Alt+Z** opens and closes the overlay. **Escape** goes back or closes it.
+- **Alt+F10** saves a replay. **Alt+F9** starts or stops recording. **Alt+F1** takes a screenshot.
+- **Settings → Video** selects a display or window. If the saved window is closed, select a source before recording.
+- **Settings → Recording** controls quality, duration and the buffer limit. **Settings → Audio** controls microphone, desktop audio and separate tracks.
 
 ## Current status
 

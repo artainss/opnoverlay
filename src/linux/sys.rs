@@ -11,6 +11,23 @@ use ashpd::documents::{DocumentID, Documents};
 
 use crate::i18n::Language;
 
+pub fn local_time() -> crate::storage::LocalTime {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let seconds: libc::time_t = now.as_secs().try_into().unwrap_or(0);
+    let mut time: libc::tm = unsafe { std::mem::zeroed() };
+    time.tm_year = 70;
+    time.tm_mday = 1;
+    unsafe {
+        if libc::localtime_r(&seconds, &mut time).is_null() {
+            let _ = libc::gmtime_r(&seconds, &mut time);
+        }
+    }
+    crate::storage::LocalTime {
+        year: 1900 + time.tm_year, month: 1 + time.tm_mon, day: time.tm_mday,
+        hour: time.tm_hour, minute: time.tm_min, second: time.tm_sec, millis: now.subsec_millis(),
+    }
+}
+
 pub fn free_space(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;

@@ -108,7 +108,18 @@ fn selftest(args: &[String]) -> Result<(), String> {
     };
     if args.iter().any(|a| a == "light-profile") { profile.apply_light_profile(); }
 
-    let source = capture::list_sources().into_iter().next().ok_or("no capture sources")?;
+    let sources = capture::list_sources();
+    let source = if let Some(title) = args.iter().find_map(|arg| arg.strip_prefix("window-title=")) {
+        if title.trim().is_empty() { return Err("window title is empty".into()); }
+        let mut windows = sources.into_iter().filter(|source| {
+            matches!(source.id, capture::SourceId::Window(_)) && source.label.contains(title)
+        });
+        let window = windows.next().ok_or_else(|| format!("window not found: {title}"))?;
+        if windows.next().is_some() { return Err(format!("more than one window matched: {title}")); }
+        window
+    } else {
+        sources.into_iter().next().ok_or("no capture sources")?
+    };
     let mic_only = args.iter().any(|a| a == "mic-only");
     let mix_mic = args.iter().any(|a| a == "mix-mic");
     let synthetic_tone = args.iter().any(|a| a == "synthetic-tone");

@@ -1,6 +1,30 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy)]
+pub struct LocalTime {
+    pub year: i32,
+    pub month: i32,
+    pub day: i32,
+    pub hour: i32,
+    pub minute: i32,
+    pub second: i32,
+    pub millis: u32,
+}
+
+impl LocalTime {
+    pub fn now() -> Self { crate::platform::sys::local_time() }
+
+    pub fn date(self) -> String {
+        format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
+    }
+
+    pub fn time(self, with_seconds: bool) -> String {
+        if with_seconds { format!("{:02}-{:02}-{:02}", self.hour, self.minute, self.second) }
+        else { format!("{:02}-{:02}", self.hour, self.minute) }
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct StorageReport {
     pub videos: u64,

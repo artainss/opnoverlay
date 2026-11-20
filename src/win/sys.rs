@@ -7,6 +7,15 @@ use windows::Win32::Foundation::HWND;
 
 use crate::i18n::Language;
 
+pub fn local_time() -> crate::storage::LocalTime {
+    let time = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    crate::storage::LocalTime {
+        year: i32::from(time.wYear), month: i32::from(time.wMonth), day: i32::from(time.wDay),
+        hour: i32::from(time.wHour), minute: i32::from(time.wMinute), second: i32::from(time.wSecond),
+        millis: u32::from(time.wMilliseconds),
+    }
+}
+
 pub struct SingleInstance(windows::Win32::Foundation::HANDLE);
 
 impl Drop for SingleInstance {
