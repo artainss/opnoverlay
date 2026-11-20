@@ -677,13 +677,14 @@ impl Aac {
 pub struct Mp4 {
     writer: IMFSinkWriter,
     path: std::path::PathBuf,
-    audio: bool,
+    video_stream: u32,
+    audio_streams: Vec<u32>,
     start: i64,
     _media: Media,
 }
 
 impl Mp4 {
-    pub fn create(path: &Path, video: &IMFMediaType, audio: Option<&IMFMediaType>, start: i64) -> Result<Self> {
+    pub fn create<'a>(path: &Path, video: &IMFMediaType, audio: impl IntoIterator<Item = &'a IMFMediaType>, start: i64) -> Result<Self> {
         let media = Media::start()?;
         unsafe {
             let mut attributes = None;
@@ -697,21 +698,30 @@ impl Mp4 {
             // Same type in and out: the writer only packages what is already encoded.
             let video_stream = writer.AddStream(video)?;
             writer.SetInputMediaType(video_stream, video, None)?;
-            if let Some(audio) = audio {
+            let formats: Vec<_> = audio.into_iter().collect();
+            let mut audio_streams = Vec::with_capacity(formats.len());
+            for audio in formats.into_iter().rev() {
                 let audio_stream = writer.AddStream(audio)?;
                 writer.SetInputMediaType(audio_stream, audio, None)?;
+                audio_streams.push(audio_stream);
             }
+            audio_streams.reverse();
             writer.BeginWriting()?;
-            Ok(Self { writer, path, audio: audio.is_some(), start, _media: media })
+            Ok(Self { writer, path, video_stream, audio_streams, start, _media: media })
         }
     }
 
     /// Writes a packet; audio from before the file's start is skipped.
-    pub fn write(&self, video: bool, packet: &Packet) -> Result<()> {
+    pub fn write(&self, audio_track: Option<usize>, packet: &Packet) -> Result<()> {
         let time = packet.time - self.start;
-        if time < 0 || (!video && !self.audio) {
-            return Ok(());
-        }
+        if time < 0 { return Ok(()); }
+        let stream = match audio_track {
+            Some(track) => {
+                let Some(stream) = self.audio_streams.get(track) else { return Ok(()) };
+                *stream
+            }
+            None => self.video_stream,
+        };
         unsafe {
             let buffer = MFCreateMemoryBuffer(packet.data.len() as u32)?;
             let mut data = std::ptr::null_mut();
@@ -726,7 +736,7 @@ impl Mp4 {
             if packet.key {
                 sample.SetUINT32(&MFSampleExtension_CleanPoint, 1)?;
             }
-            self.writer.WriteSample(if video { 0 } else { 1 }, &sample)
+            self.writer.WriteSample(stream, &sample)
         }
     }
 
@@ -739,7 +749,7 @@ impl Mp4 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D11::{
@@ -834,16 +844,51 @@ mod tests {
     #[ignore]
     fn decode_captured_audio_from_file() {
         use windows::core::HSTRING;
-        use windows::Win32::Media::MediaFoundation::{MFCreateSourceReaderFromURL, MFAudioFormat_PCM, MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READER_FIRST_AUDIO_STREAM};
-        let path = std::env::var_os("OPNOVERLAY_CHECK_FILE").expect("OPNOVERLAY_CHECK_FILE is required");
+        use windows::Win32::Media::MediaFoundation::MF_SOURCE_READER_FIRST_AUDIO_STREAM;
+        let path = HSTRING::from(std::env::var_os("OPNOVERLAY_CHECK_FILE").expect("OPNOVERLAY_CHECK_FILE is required"));
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             let _media = Media::start().unwrap();
-            let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path), None).unwrap();
+            if std::env::var_os("OPNOVERLAY_EXPECT_SEPARATE_AUDIO").is_some() {
+                verify_separate_audio(&path);
+            } else {
+                let dump = std::env::var_os("OPNOVERLAY_TEST_PCM_OUTPUT");
+                let [at_440, _] = decode_audio_track(&path, MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32, dump);
+                if std::env::var_os("OPNOVERLAY_EXPECT_SOUND").is_some() {
+                    assert!(at_440 > 50.0, "test tone too quiet: {at_440}");
+                }
+            }
+        }
+    }
+
+    pub(in crate::win) fn verify_separate_audio(path: &windows::core::HSTRING) {
+        use windows::Win32::Media::MediaFoundation::MFCreateSourceReaderFromURL;
+        unsafe {
+            let reader = MFCreateSourceReaderFromURL(path, None).unwrap();
+            let streams: Vec<_> = (0..32).map_while(|index| reader.GetNativeMediaType(index, 0).ok().map(|format| (index, format)))
+                .filter(|(_, format)| format.GetGUID(&MF_MT_MAJOR_TYPE).is_ok_and(|kind| kind == MFMediaType_Audio))
+                .map(|(index, _)| index).collect();
+            assert_eq!(streams.len(), 3, "expected the mix, game, and microphone tracks");
+            let amplitudes: Vec<_> = streams.into_iter().map(|stream| decode_audio_track(path, stream, None)).collect();
+            for (track, [at_440, at_660]) in amplitudes.into_iter().enumerate() {
+                match track {
+                    0 => assert!(at_440 > 500.0 && at_660 > 500.0, "both tones must be in the shared mix"),
+                    1 => assert!(at_440 > 500.0 && at_660 < 100.0, "microphone tone leaked into game audio"),
+                    2 => assert!(at_660 > 500.0 && at_440 < 100.0, "game tone leaked into microphone audio"),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    fn decode_audio_track(path: &windows::core::HSTRING, stream: u32, dump: Option<std::ffi::OsString>) -> [f64; 2] {
+        use windows::Win32::Media::MediaFoundation::{MFCreateSourceReaderFromURL, MFAudioFormat_PCM, MF_SOURCE_READERF_ENDOFSTREAM};
+        unsafe {
+            let reader = MFCreateSourceReaderFromURL(path, None).unwrap();
+            reader.SetStreamSelection(stream, true).unwrap();
             let output = MFCreateMediaType().unwrap();
             output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).unwrap();
             output.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM).unwrap();
-            let stream = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
             reader.SetCurrentMediaType(stream, None, &output).unwrap();
             let (mut samples, mut bytes) = (0usize, 0u64);
             let format = reader.GetCurrentMediaType(stream).unwrap();
@@ -853,8 +898,8 @@ mod tests {
             assert_eq!(format.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).unwrap(), 48_000);
             let mut peak = 0i32;
             let mut decoded = Vec::new();
-            let mut samples_440 = 0u64;
-            let (mut sine, mut cosine) = (0.0f64, 0.0f64);
+            let mut frame_count = 0u64;
+            let mut tones = [(0.0f64, 0.0f64); 2];
             loop {
                 let (mut flags, mut sample) = (0u32, None);
                 reader.ReadSample(stream, 0, None, Some(&mut flags), None, Some(&mut sample)).unwrap();
@@ -865,7 +910,7 @@ mod tests {
                     let (mut data, mut len) = (std::ptr::null_mut(), 0);
                     buffer.Lock(&mut data, None, Some(&mut len)).unwrap();
                     let audio = std::slice::from_raw_parts(data, len as usize);
-                    if std::env::var_os("OPNOVERLAY_TEST_PCM_OUTPUT").is_some() { decoded.extend_from_slice(audio); }
+                    if dump.is_some() { decoded.extend_from_slice(audio); }
                     let (channel_samples, _) = audio.as_chunks::<2>();
                     for &sample in channel_samples {
                         peak = peak.max(i32::from(i16::from_le_bytes(sample)).abs());
@@ -873,20 +918,23 @@ mod tests {
                     let (frames, _) = audio.as_chunks::<4>();
                     for frame in frames {
                         let value = f64::from(i16::from_le_bytes([frame[0], frame[1]]));
-                        let phase = samples_440 as f64 * 440.0 * std::f64::consts::TAU / 48_000.0;
-                        sine += value * phase.sin();
-                        cosine += value * phase.cos();
-                        samples_440 += 1;
+                        let phase = frame_count as f64 * std::f64::consts::TAU / 48_000.0;
+                        for ((sine, cosine), frequency) in tones.iter_mut().zip([440.0, 660.0]) {
+                            let (x, y) = (phase * frequency).sin_cos();
+                            *sine += value * x;
+                            *cosine += value * y;
+                        }
+                        frame_count += 1;
                     }
                     buffer.Unlock().unwrap();
                 }
                 if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 { break; }
             }
             assert!(samples > 0 && bytes > 0);
-            if let Some(path) = std::env::var_os("OPNOVERLAY_TEST_PCM_OUTPUT") { std::fs::write(path, decoded).unwrap(); }
-            let tone = 2.0 * sine.hypot(cosine) / samples_440.max(1) as f64;
-            if std::env::var_os("OPNOVERLAY_EXPECT_SOUND").is_some() { assert!(tone > 50.0, "test tone too quiet: {tone}"); }
-            println!("decoded {samples} audio samples, {bytes} bytes, peak {peak}, 440 Hz amplitude {tone:.1}");
+            if let Some(path) = dump { std::fs::write(path, decoded).unwrap(); }
+            let amplitudes = tones.map(|(sine, cosine)| 2.0 * sine.hypot(cosine) / frame_count.max(1) as f64);
+            println!("decoded {samples} audio samples, {bytes} bytes, peak {peak}, 440 Hz amplitude {:.1}, 660 Hz amplitude {:.1}", amplitudes[0], amplitudes[1]);
+            amplitudes
         }
     }
 

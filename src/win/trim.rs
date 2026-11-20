@@ -66,12 +66,15 @@ fn trim_exact(source: &Path, destination: &Path, start: i64, end: i64) -> Result
         let _media = Media::start().map_err(|e| e.to_string())?;
         let reader = MFCreateSourceReaderFromURL(&HSTRING::from(source.as_os_str()), None).map_err(|e| e.to_string())?;
         let mut video = None;
-        let mut audio = None;
+        let mut audio = Vec::new();
         for index in 0..32 {
             let Ok(format) = reader.GetNativeMediaType(index, 0) else { break };
             let major = format.GetGUID(&MF_MT_MAJOR_TYPE).map_err(|e| e.to_string())?;
             if major == MFMediaType_Video && video.is_none() { video = Some((index, format)); }
-            else if major == MFMediaType_Audio && audio.is_none() { audio = Some((index, format)); }
+            else if major == MFMediaType_Audio {
+                reader.SetStreamSelection(index, true).map_err(|e| e.to_string())?;
+                audio.push((index, format));
+            }
             else { reader.SetStreamSelection(index, false).map_err(|e| e.to_string())?; }
         }
         let (video_index, native_video) = video.ok_or("В файле нет видеодорожки.")?;
@@ -104,11 +107,12 @@ fn trim_exact(source: &Path, destination: &Path, start: i64, end: i64) -> Result
         let writer = MFCreateSinkWriterFromURL(&HSTRING::from(destination.as_os_str()), None, &attributes).map_err(|e| e.to_string())?;
         let output_video = writer.AddStream(&output_type).map_err(|e| e.to_string())?;
         writer.SetInputMediaType(output_video, &decoded_type, None).map_err(|e| e.to_string())?;
-        let output_audio = if let Some((_, format)) = &audio {
+        let mut output_audio = Vec::with_capacity(audio.len());
+        for (index, format) in audio.iter().rev() {
             let stream = writer.AddStream(format).map_err(|e| e.to_string())?;
             writer.SetInputMediaType(stream, format, None).map_err(|e| e.to_string())?;
-            Some(stream)
-        } else { None };
+            output_audio.push((*index, stream));
+        }
         writer.BeginWriting().map_err(|e| e.to_string())?;
         let mut position = PROPVARIANT::default();
         (*position.Anonymous.Anonymous).vt = VT_I8;
@@ -116,7 +120,7 @@ fn trim_exact(source: &Path, destination: &Path, start: i64, end: i64) -> Result
         reader.SetCurrentPosition(&windows::core::GUID::zeroed(), &position).map_err(|e| e.to_string())?;
         let mut first = None;
         let mut last = 0;
-        let mut remaining = if audio.is_some() { 2 } else { 1 };
+        let mut remaining = 1 + output_audio.len();
         while remaining > 0 {
             let (mut stream, mut flags, mut timestamp, mut sample) = (0, 0, 0, None);
             reader.ReadSample(MF_SOURCE_READER_ANY_STREAM.0 as u32, 0, Some(&mut stream), Some(&mut flags), Some(&mut timestamp), Some(&mut sample)).map_err(|e| e.to_string())?;
@@ -139,8 +143,8 @@ fn trim_exact(source: &Path, destination: &Path, start: i64, end: i64) -> Result
                 let packed = pack_nv12_sample(&sample, width, height, stride)?;
                 writer.WriteSample(output_video, &packed).map_err(|e| e.to_string())?;
                 last = timestamp + duration;
-            } else if audio.as_ref().is_some_and(|(index, _)| *index == stream) && let Some(output_audio) = output_audio {
-                writer.WriteSample(output_audio, &sample).map_err(|e| e.to_string())?;
+            } else if let Some((_, output_stream)) = output_audio.iter().find(|(input, _)| *input == stream) {
+                writer.WriteSample(*output_stream, &sample).map_err(|e| e.to_string())?;
             }
         }
         let first = first.ok_or("В выбранном отрезке нет кадров.")?;
@@ -240,6 +244,19 @@ mod tests {
             assert!(frames > 0 && brightest > 25.0, "decoded {frames} frames; brightest luma {brightest:.1}");
             println!("decoded {frames} frames; brightest luma {brightest:.1}");
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn trim_preserves_three_audio_tracks() {
+        let file = std::path::PathBuf::from(std::env::var_os("OPNOVERLAY_CHECK_FILE").unwrap());
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path().join("trimmed.mp4");
+        let (start, end) = trim(&file, &output, 10_000_000, 40_000_000).unwrap();
+        assert!(end - start > 25_000_000);
+        unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
+        let _media = Media::start().unwrap();
+        super::super::mf::tests::verify_separate_audio(&HSTRING::from(output.as_os_str()));
     }
 
     #[test]

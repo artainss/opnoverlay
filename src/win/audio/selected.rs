@@ -1,16 +1,11 @@
-use std::os::windows::ffi::OsStringExt;
-#[cfg(test)]
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::path::PathBuf;
-#[cfg(test)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use windows::Win32::Foundation::{FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-#[cfg(test)]
 use windows::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -79,9 +74,8 @@ impl SelectedInput {
         let (worker_process, worker_shared, worker_state) = (process.clone(), shared.clone(), state.clone());
         thread::Builder::new().name("selected-application-audio".into()).spawn(move || {
             let _slot = slot;
-            let mut opened = false;
             let result = wasapi::initialize_mta().ok().map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
-                .and_then(|()| super::stream(InputKind::Application(worker_process.id.pid), None, &worker_shared, false, &mut opened, |running| {
+                .and_then(|()| super::stream(InputKind::Application(worker_process.id.pid), None, &worker_shared, false, |running| {
                     let alive = !worker_shared.stopped() && worker_process.alive()?;
                     if running && alive {
                         let mut state = worker_state.lock().unwrap();
@@ -104,6 +98,10 @@ impl SelectedInput {
 
     pub fn state(&self) -> CaptureState {
         self.state.lock().unwrap().clone()
+    }
+
+    pub fn can_reconnect(&self) -> bool {
+        matches!(*self.state.lock().unwrap(), CaptureState::Exited | CaptureState::Failed(_))
     }
 }
 
@@ -180,8 +178,7 @@ fn trees_may_overlap(a: ProcessId, b: ProcessId, entries: &[PROCESSENTRY32W]) ->
     true
 }
 
-#[cfg(test)]
-fn same_image(a: &Path, b: &Path) -> bool {
+pub fn same_image(a: &Path, b: &Path) -> bool {
     let a: Vec<u16> = a.as_os_str().encode_wide().collect();
     let b: Vec<u16> = b.as_os_str().encode_wide().collect();
     unsafe { CompareStringOrdinal(&a, &b, true) == CSTR_EQUAL }
@@ -219,12 +216,12 @@ mod tests {
         let input = SelectedInput::start(process, 1.0, eframe::egui::Context::default()).expect("game audio capture failed");
         let title = std::env::var("OPNOVERLAY_TEST_GAME_TITLE").unwrap();
         let source = crate::capture::list_sources().into_iter().find(|source| matches!(source.id, crate::capture::SourceId::Window(_)) && source.label.contains(&title)).expect("game source missing");
-        let session = crate::capture::Session::start(crate::capture::SessionOptions { source: source.id, fps: 30, cursor: true, preview_fps: 0, record: Some(crate::capture::RecordConfig { quality: crate::config::Quality::Medium, custom_bitrate_mbps: 12, resolution: crate::config::Resolution::Native, audio: true, region: None, overlay: None }) }, None).expect("game video capture failed");
+        let session = crate::capture::Session::start(crate::capture::SessionOptions { source: source.id, fps: 30, cursor: true, desktop_duplication: false, preview_fps: 0, record: Some(crate::capture::RecordConfig { quality: crate::config::Quality::Medium, custom_bitrate_mbps: 12, resolution: crate::config::Resolution::Native, display_canvas: None, audio: true, separate_audio_tracks: false, region: None, overlay: None }) }, None).expect("game video capture failed");
         let out = std::path::PathBuf::from(std::env::var_os("OPNOVERLAY_TEST_GAME_FILE").unwrap());
         session.shared.outputs.lock().unwrap().start_file(out);
         let shared = session.shared.clone();
         let mixer = crate::audio::Mixer::start(vec![input.shared.clone()], shared.encoder_ready.clone(), shared.clock.clone(), move |pcm| {
-            if let Some(encoder) = shared.encoder.lock().unwrap().as_ref() { encoder.push_audio(pcm); }
+            if let Some(encoder) = shared.encoder.lock().unwrap().as_ref() { encoder.push_audio_track(0, pcm); }
         });
         std::thread::sleep(Duration::from_secs(8));
         drop(mixer);

@@ -40,15 +40,14 @@ pub fn list_devices(kind: InputKind) -> Vec<Device> {
 
 pub fn capture(kind: InputKind, device_id: Option<&str>, shared: &InputShared) -> Result<(), Box<dyn Error>> {
     wasapi::initialize_mta().ok()?;
-    let follows_default = device_id.is_none() && matches!(kind, InputKind::System | InputKind::Microphone);
-    let mut opened = false;
+    let is_endpoint = matches!(kind, InputKind::System | InputKind::Microphone);
+    let follows_default = device_id.is_none() && is_endpoint;
     while !shared.stopped() {
-        match stream(kind, device_id, shared, follows_default, &mut opened, |_| Ok(true)) {
-            Ok(()) => {}
-            Err(_) if follows_default && opened => {
-                
-                
-                shared.silent();
+        match stream(kind, device_id, shared, follows_default, |_| Ok(true)) {
+            Ok(()) => shared.discard_samples(),
+            Err(error) if is_endpoint => {
+                shared.discard_samples();
+                shared.set_error(Some(error.to_string()));
                 for _ in 0..20 {
                     if shared.stopped() {
                         break;
@@ -68,7 +67,6 @@ fn stream(
     device_id: Option<&str>,
     shared: &InputShared,
     follows_default: bool,
-    opened: &mut bool,
     mut valid: impl FnMut(bool) -> Result<bool, Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
     if !valid(false)? {
@@ -103,7 +101,7 @@ fn stream(
         return Ok(());
     }
     client.start_stream()?;
-    *opened = true;
+    shared.set_error(None);
 
     let mut raw: VecDeque<u8> = VecDeque::new();
     let mut checked = Instant::now();

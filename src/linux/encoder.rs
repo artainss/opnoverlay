@@ -190,7 +190,7 @@ impl Encoder {
                  ! appsink name=sink sync=false"
             ))?;
             let src = by_name::<gst_app::AppSrc>(&pipeline, "src")?;
-            outputs.lock().unwrap().set_audio_format(Some(aac_caps()));
+            outputs.lock().unwrap().set_audio_formats(vec![aac_caps()]);
             Some((pipeline, src))
         } else {
             None
@@ -266,7 +266,7 @@ impl Encoder {
                     .new_sample(move |sink| {
                         let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                         if let Some(packet) = to_packet(&sample) {
-                            out.lock().unwrap().audio(vec![Packet { key: true, ..packet }]);
+                            out.lock().unwrap().audio(0, vec![Packet { key: true, ..packet }]);
                         }
                         Ok(gst::FlowSuccess::Ok)
                     })

@@ -21,7 +21,7 @@ use crate::audio::{self, Device, Input, InputKind, METER_FLOOR, Mixer};
 use crate::camera::{self, Camera, CameraConfig, CameraDevice, CameraFrame, CameraSize, Corner};
 use crate::capture::{self, RecordConfig, Session, SessionOptions, Source, SourceId};
 use crate::platform::encoder::{Encoder, PendingFile};
-use crate::config::{Config, Hotkeys, HudCorner, Quality, Region, ReplayStorage, Resolution, ScreenshotFormat};
+use crate::config::{Config, Hotkeys, HudCorner, HudSize, ProfileSource, Quality, RecordingProfile, Region, ReplayStorage, Resolution, ScreenshotFormat};
 use crate::hotkeys::{self, Binding, GlobalHotkeys};
 use crate::i18n::{self, Language, tr, tr3};
 use crate::tray::{Tray, TrayCommand, TrayState};
@@ -61,13 +61,63 @@ enum Action {
 enum RecState {
     Idle,
     /// Capturing and encoding, for a recording, the replay buffer or both.
-    Active { session: Session, mixer: Option<Mixer>, recording: Option<Recording>, replay: bool },
+    Active {
+        session: Session,
+        mixer: Option<Mixer>,
+        recording: Option<Recording>,
+        replay: bool,
+        #[cfg(windows)]
+        source: CaptureSource,
+    },
     /// The last output was stopped and the recording is being written out.
-    Saving(Receiver<Result<PathBuf, String>>),
+    Saving(Receiver<Status>),
 }
 
 /// A recording in progress (the session may also be running for the replay buffer).
 struct Recording;
+
+#[cfg(windows)]
+#[derive(Clone)]
+enum CaptureSource {
+    Monitor { handle: isize, key: Option<String> },
+    Window { handle: isize, process: Option<u32> },
+}
+
+#[cfg(windows)]
+impl CaptureSource {
+    fn identify(id: SourceId) -> Self {
+        match id {
+            SourceId::Monitor(handle) => Self::Monitor { handle, key: capture::display_key(id) },
+            SourceId::Window(handle) => Self::Window { handle, process: Self::window_process(handle) },
+        }
+    }
+
+    fn window_process(handle: isize) -> Option<u32> {
+        crate::platform::fps::window_process(windows::Win32::Foundation::HWND(handle as *mut _))
+    }
+
+    fn matches(&self, candidate: SourceId) -> bool {
+        match (self, candidate) {
+            (Self::Monitor { key: Some(expected), .. }, SourceId::Monitor(_)) => {
+                capture::display_key(candidate).is_some_and(|key| key.eq_ignore_ascii_case(expected))
+            }
+            (Self::Monitor { handle, key: None }, SourceId::Monitor(candidate)) => *handle == candidate,
+            (Self::Window { handle, process: Some(expected) }, SourceId::Window(candidate)) => {
+                *handle == candidate && Self::window_process(candidate) == Some(*expected)
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(windows)]
+struct CaptureResume {
+    source: Option<CaptureSource>,
+    recording: bool,
+    replay: bool,
+    paused: bool,
+    not_before: Option<Instant>,
+}
 
 struct Status {
     text: String,
@@ -151,12 +201,22 @@ struct SystemMeter {
     #[cfg(windows)]
     fps_monitor: Option<crate::platform::fps::FpsMonitor>,
     #[cfg(windows)]
-    fps: Option<(Instant, Option<f64>)>,
+    fps_target: Option<u32>,
+    #[cfg(windows)]
+    fps: Option<crate::platform::fps::FrameSample>,
 }
 
 type DiskCheckResults = Vec<(&'static str, Option<u64>)>;
 #[cfg(windows)]
-type AudioChoices = Vec<(String, Arc<crate::platform::audio::selected::SelectedProcess>)>;
+type AudioChoices = Vec<(String, Arc<SelectedProcess>)>;
+#[cfg(windows)]
+use crate::platform::audio::selected::{self, CaptureState, ProcessId, SelectedInput, SelectedProcess};
+
+#[cfg(windows)]
+struct PendingAudioConnection {
+    replaces: Option<ProcessId>,
+    result: Receiver<Result<SelectedInput, String>>,
+}
 
 pub struct App {
     config: Config,
@@ -173,13 +233,13 @@ pub struct App {
     /// Application Audio Capture, when its application is running.
     app_audio: Option<Input>,
     #[cfg(windows)]
-    selected_audio: Vec<crate::platform::audio::selected::SelectedInput>,
+    selected_audio: Vec<SelectedInput>,
     #[cfg(windows)]
     selected_audio_menu: Option<Receiver<AudioChoices>>,
     #[cfg(windows)]
     selected_audio_choices: AudioChoices,
     #[cfg(windows)]
-    selected_audio_add: Option<Receiver<Result<crate::platform::audio::selected::SelectedInput, String>>>,
+    selected_audio_add: Option<PendingAudioConnection>,
     audio_apps: Vec<capture::AudioApp>,
     cameras: Vec<CameraDevice>,
     camera: Option<Camera>,
@@ -215,6 +275,8 @@ pub struct App {
     opening: Option<OpeningAnimation>,
     closing: Option<OpeningAnimation>,
     #[cfg(windows)]
+    overlay_display: Option<isize>,
+    #[cfg(windows)]
     focus_armed: bool,
     exit_requested: bool,
     advanced_view: bool,
@@ -239,17 +301,20 @@ pub struct App {
     #[cfg(windows)]
     trim_error: Option<String>,
     gallery_deletions: Vec<Receiver<(PathBuf, Result<(), String>)>>,
+    gallery_query: String,
+    gallery_limit: usize,
     gallery_thumbnails: HashMap<PathBuf, Option<TextureHandle>>,
     gallery_loading: HashMap<PathBuf, Receiver<Option<egui::ColorImage>>>,
     disk_check: Option<Receiver<DiskCheckResults>>,
     last_disk_check: Option<Instant>,
     low_disk_warned: bool,
+    disk_replay_budget: Arc<crate::disk_buffer::DiskBudget>,
     #[cfg(windows)]
     desktop_available: bool,
     #[cfg(windows)]
     desktop_checked: Instant,
     #[cfg(windows)]
-    desktop_resume: Option<(bool, bool, bool)>,
+    desktop_resume: Option<CaptureResume>,
     /// A newer release, once the start-up check has answered.
     update: Option<Release>,
     update_check: Option<Receiver<Option<Release>>>,
@@ -270,7 +335,7 @@ impl App {
             Ok(enabled) => { config.auto_start_windows = enabled; None }
             Err(error) => Some(error),
         };
-        if cfg!(windows) && !config.setup_complete && startup_error.is_none() {
+        if cfg!(windows) && crate::config::portable_dir().is_none() && !config.setup_complete && startup_error.is_none() {
             config.auto_start_windows = true;
         }
         let actions = Arc::new(Mutex::new(Vec::new()));
@@ -338,6 +403,8 @@ impl App {
             opening: None,
             closing: None,
             #[cfg(windows)]
+            overlay_display: None,
+            #[cfg(windows)]
             focus_armed: false,
             exit_requested: false,
             advanced_view: false,
@@ -362,11 +429,14 @@ impl App {
             #[cfg(windows)]
             trim_error: None,
             gallery_deletions: Vec::new(),
+            gallery_query: String::new(),
+            gallery_limit: GALLERY_PAGE_SIZE,
             gallery_thumbnails: HashMap::new(),
             gallery_loading: HashMap::new(),
             disk_check: None,
             last_disk_check: None,
             low_disk_warned: false,
+            disk_replay_budget: Arc::default(),
             #[cfg(windows)]
             desktop_available: crate::platform::sys::interactive_desktop_available(),
             #[cfg(windows)]
@@ -416,7 +486,7 @@ impl App {
         }
         #[cfg(windows)]
         if !app.desktop_available && app.config.setup_complete && app.config.auto_start_replay && !app.is_replaying() {
-            app.desktop_resume = Some((false, true, false));
+            app.desktop_resume = Some(CaptureResume { source: app.selected.map(CaptureSource::identify), recording: false, replay: true, paused: false, not_before: None });
         }
         if let Some(error) = startup_error {
             app.set_status(tr3!("No se pudo comprobar el inicio automático: {}", "Could not check startup: {}", "Не удалось проверить автозапуск: {}", error), None, true);
@@ -497,6 +567,12 @@ impl App {
         self.sources = capture::list_sources();
         let still_there = self.selected.is_some_and(|id| self.sources.iter().any(|s| s.id == id));
         if !still_there {
+            #[cfg(windows)]
+            if let Some(wanted) = &self.config.source_display {
+                self.selected = self.sources.iter().map(|source| source.id)
+                    .find(|id| capture::display_key(*id).is_some_and(|key| key.eq_ignore_ascii_case(wanted)));
+                return;
+            }
             let wanted = self.config.source_label.as_deref();
             self.selected = self
                 .sources
@@ -510,14 +586,16 @@ impl App {
     fn refresh_devices(&mut self) {
         self.system_devices = audio::list_devices(InputKind::System);
         self.mic_devices = audio::list_devices(InputKind::Microphone);
-        // A saved device that disappeared falls back to the Windows default.
-        let keep = |id: &mut Option<String>, devices: &[Device]| {
-            if id.as_ref().is_some_and(|id| !devices.iter().any(|d| &d.id == id)) {
-                *id = None;
-            }
-        };
-        keep(&mut self.config.system_device, &self.system_devices);
-        keep(&mut self.config.mic_device, &self.mic_devices);
+        #[cfg(not(windows))]
+        {
+            let keep = |id: &mut Option<String>, devices: &[Device]| {
+                if id.as_ref().is_some_and(|id| !devices.iter().any(|d| &d.id == id)) {
+                    *id = None;
+                }
+            };
+            keep(&mut self.config.system_device, &self.system_devices);
+            keep(&mut self.config.mic_device, &self.mic_devices);
+        }
     }
 
     fn selected_source(&self) -> Option<&Source> {
@@ -529,6 +607,8 @@ impl App {
         // A region belongs to the source it was drawn on.
         self.config.region = None;
         self.config.source_label = self.selected_source().map(|s| s.label.clone());
+        #[cfg(windows)]
+        { self.config.source_display = capture::display_key(id); }
         self.restart_preview(ctx);
     }
 
@@ -640,7 +720,7 @@ impl App {
 
     fn selected_audio_missing(&self) -> bool {
         #[cfg(windows)]
-        { self.selected_audio_only() && self.selected_audio.is_empty() }
+        { self.selected_audio_only() && self.selected_audio.iter().all(SelectedInput::can_reconnect) }
         #[cfg(not(windows))]
         { false }
     }
@@ -691,10 +771,22 @@ impl App {
             return;
         }
         let Some(source) = self.selected else { return };
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+            if let SourceId::Window(window) = source && !unsafe { IsWindow(Some(HWND(window as *mut _))).as_bool() } {
+                self.source_lost(tr3!("La ventana seleccionada ya no está disponible.", "The selected window is no longer available.", "Выбранное окно больше недоступно.").into());
+                return;
+            }
+            if !self.preview_visible() { return; }
+        }
         let opts = SessionOptions {
             source,
             fps: PREVIEW_FPS,
             cursor: self.config.cursor,
+            #[cfg(windows)]
+            desktop_duplication: self.config.desktop_duplication,
             preview_fps: PREVIEW_FPS,
             record: None,
         };
@@ -702,6 +794,11 @@ impl App {
             Ok(s) => self.preview = Some(s),
             Err(e) => self.source_lost(tr3!("No se pudo capturar la fuente: {}", "Could not capture the source: {}", "Не удалось захватить изображение: {}", e)),
         }
+    }
+
+    #[cfg(windows)]
+    fn preview_visible(&self) -> bool {
+        self.advanced_view && !self.hidden && self.settings.is_none()
     }
 
     /// The selected source cannot be captured (e.g. its window was closed): stop showing
@@ -810,7 +907,11 @@ impl App {
             let mut outputs = session.shared.outputs.lock().unwrap();
             match self.config.replay_storage {
                 ReplayStorage::Memory => { outputs.set_replay(Some(self.config.replay_seconds)); Ok(()) }
-                ReplayStorage::Disk => outputs.set_replay_on_disk(self.config.replay_seconds),
+                ReplayStorage::Disk => outputs.set_replay_on_disk(
+                    self.config.replay_seconds,
+                    self.disk_replay_budget.clone(),
+                    self.config.replay_disk_limit_bytes(),
+                ),
             }
         };
         if let Err(error) = result {
@@ -898,12 +999,18 @@ impl App {
             source,
             fps: self.config.fps,
             cursor: self.config.cursor,
+            #[cfg(windows)]
+            desktop_duplication: self.config.desktop_duplication,
             preview_fps: PREVIEW_FPS,
             record: Some(RecordConfig {
                 quality: self.config.quality,
                 custom_bitrate_mbps: self.config.custom_bitrate_mbps,
                 resolution: self.config.resolution,
+                #[cfg(windows)]
+                display_canvas: self.capture_display_canvas(),
                 audio: true,
+                #[cfg(windows)]
+                separate_audio_tracks: self.config.separate_audio_tracks,
                 region: self.config.region,
                 overlay: self.overlay(),
             }),
@@ -918,11 +1025,20 @@ impl App {
         };
         let mixer = Some({
             let shared = session.shared.clone();
+            #[cfg(windows)]
+            let mixer = Mixer::start_with_tracks(inputs, shared.encoder_ready.clone(), shared.clock.clone(), self.config.separate_audio_tracks, move |track, pcm| {
+                if let Some(enc) = shared.encoder.lock().unwrap().as_ref() {
+                    enc.push_audio_track(track, pcm);
+                }
+            });
+            #[cfg(not(windows))]
+            let mixer =
             Mixer::start(inputs, shared.encoder_ready.clone(), shared.clock.clone(), move |pcm| {
                 if let Some(enc) = shared.encoder.lock().unwrap().as_ref() {
                     enc.push_audio(pcm);
                 }
-            })
+            });
+            mixer
         });
         if let Some(camera) = &self.camera {
             let shared = session.shared.clone();
@@ -937,7 +1053,11 @@ impl App {
                 }
             }));
         }
-        self.rec = RecState::Active { session, mixer, recording: None, replay: false };
+        self.rec = RecState::Active {
+            session, mixer, recording: None, replay: false,
+            #[cfg(windows)]
+            source: CaptureSource::identify(source),
+        };
         true
     }
 
@@ -952,13 +1072,9 @@ impl App {
         // The replay buffer keeps the session going: only the file ends.
         let file = session.shared.outputs.lock().unwrap().take_file();
         self.set_status(tr!("Guardando grabación…", "Saving recording…"), None, false);
-        self.spawn_job(ctx, move || match file.map(PendingFile::finish) {
-            Some(Ok(path)) => match ensure_recording_finalized(path) {
-                Ok(path) => recording_saved(path),
-                Err(error) => failed(error),
-            },
-            Some(Err(e)) => failed(tr!("Error al guardar la grabación: {}", "Error saving the recording: {}", e)),
-            None => failed(tr!("no se capturó ningún fotograma", "no frames were captured").into()),
+        self.spawn_job(ctx, move || match file {
+            Some(file) => finalize_recording(file, None),
+            None => failed(tr3!("No se capturó ningún fotograma.", "No frames were captured.", "Не получено ни одного кадра.").into()),
         });
     }
 
@@ -994,11 +1110,12 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         let ctx2 = ctx.clone();
+        let interruption = stop_error.or_else(|| reason.clone());
         // Finalizing the MP4 can take a moment; keep the UI responsive.
         thread::spawn(move || {
             let result = match encoder.map(Encoder::finish) {
-                Some(Some(file)) => file.finish().and_then(ensure_recording_finalized),
-                _ => Err(stop_error.unwrap_or_else(|| tr!("no se capturó ningún fotograma", "no frames were captured").into())),
+                Some(Some(file)) => finalize_recording(file, interruption),
+                _ => failed(interruption.unwrap_or_else(|| tr3!("No se capturó ningún fotograma.", "No frames were captured.", "Не получено ни одного кадра.").into())),
             };
             let _ = tx.send(result);
             ctx2.request_repaint();
@@ -1010,6 +1127,8 @@ impl App {
 
     fn show_window(&mut self, ctx: &egui::Context) {
         let width = if self.advanced_view { 740.0 } else { 420.0 };
+        #[cfg(windows)]
+        if self.closing.is_none() { self.overlay_display = crate::platform::sys::active_display(); }
         let (from, to) = self.closing.take().map(|closing| (closing.position(), closing.rest)).unwrap_or((pos2(-width, 0.0), pos2(0.0, 0.0)));
         self.hidden = false;
         #[cfg(windows)]
@@ -1017,18 +1136,43 @@ impl App {
         self.opening = Some(OpeningAnimation { last: Instant::now(), progress: 0.0, from, to, rest: to, duration: 0.14 });
         #[cfg(windows)]
         if let Some(window) = self.native_window {
-            crate::platform::sys::prepare_slide_in(window);
+            let (x, y, _) = self.overlay_position_pixels(ctx, from);
+            crate::platform::sys::prepare_slide_in(window, x, y);
         }
         self.set_taskbar_button(false);
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(from));
+        self.move_overlay(ctx, from);
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    #[cfg(windows)]
+    fn overlay_position_pixels(&self, ctx: &egui::Context, local: egui::Pos2) -> (i32, i32, i32) {
+        let bounds = self.overlay_display.and_then(crate::platform::sys::display_bounds).unwrap_or_default();
+        let scale = ctx.pixels_per_point();
+        let x = (local.x * scale).round() as i32;
+        let y = (local.y * scale).round() as i32;
+        (bounds.left + x, bounds.top + y, (-x).max(0))
+    }
+
+    fn move_overlay(&self, ctx: &egui::Context, local: egui::Pos2) {
+        #[cfg(windows)]
+        if let Some(window) = self.native_window {
+            let (x, y, clip_left) = self.overlay_position_pixels(ctx, local);
+            crate::platform::sys::position_overlay(window, x, y, clip_left);
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(local));
     }
 
     fn hide_window(&mut self, ctx: &egui::Context) {
         if self.hidden { return; }
         if self.settings.take().is_some() { self.bind_hotkeys(); }
         let rect = ctx.input(|i| i.viewport().outer_rect);
+        #[cfg(windows)]
+        let rect = rect.map(|rect| {
+            let (x, y, _) = self.overlay_position_pixels(ctx, pos2(0.0, 0.0));
+            rect.translate(-vec2(x as f32, y as f32) / ctx.pixels_per_point())
+        });
         let opening = self.opening.take();
         let from = opening.as_ref().map(OpeningAnimation::position).or_else(|| rect.map(|r| r.min)).unwrap_or(pos2(0.0, 0.0));
         let rest = opening.as_ref().map(|opening| opening.to).unwrap_or(from);
@@ -1057,13 +1201,15 @@ impl App {
     fn advance_window_animation(&mut self, ctx: &egui::Context, now: Instant) {
         if let Some(opening) = &mut self.opening {
             let progress = opening.advance(now);
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(opening.position()));
+            let position = opening.position();
+            self.move_overlay(ctx, position);
             if progress < 1.0 { ctx.request_repaint_after(Duration::from_millis(16)); }
             else { self.opening = None; }
         }
         if let Some(closing) = &mut self.closing {
             let progress = closing.advance(now);
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(closing.position()));
+            let position = closing.position();
+            self.move_overlay(ctx, position);
             if progress < 1.0 { ctx.request_repaint_after(Duration::from_millis(16)); }
             else { self.finish_hide_window(ctx); }
         }
@@ -1305,7 +1451,7 @@ impl App {
         let file_size = file_size.map_or_else(|| text("Размер неизвестен", "Unknown size", "Tamaño desconocido").to_owned(), |size| format!("{:.1} {}", size as f64 / 1_048_576.0, text("МБ", "MB", "MB")));
         egui::CentralPanel::default().frame(egui::Frame::new().fill(GREY8).inner_margin(18)).show(ui, |ui| {
             let content_height = ui.available_height() - if can_restore { 30.0 } else { 0.0 };
-            let column_width = ui.available_width().min(((content_height - 340.0).max(100.0) * 16.0 / 9.0).max(320.0));
+            let column_width = ui.available_width().min(((content_height - 370.0).max(100.0) * 16.0 / 9.0).max(320.0));
             let gutter = ((ui.available_width() - column_width) / 2.0).max(0.0);
             ui.horizontal(|ui| {
                 ui.add_space(gutter);
@@ -1314,8 +1460,8 @@ impl App {
                     close = viewer_header(ui, path, text("ВИДЕО", "VIDEO", "VÍDEO"), language);
                     ui.add_space(12.0);
                     let width = ui.available_width();
-                    let height = (width * 9.0 / 16.0).min((content_height - 337.0).max(100.0));
-                    let spare = (content_height - height - 337.0).max(0.0);
+                    let height = (width * 9.0 / 16.0).min((content_height - 367.0).max(100.0));
+                    let spare = (content_height - height - 367.0).max(0.0);
                     ui.add_space(spare * 0.45);
                     let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
                     ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
@@ -1342,6 +1488,20 @@ impl App {
                         ui.spacing_mut().slider_width = (ui.available_width() - 16.0).max(40.0);
                         if ui.add_enabled(duration > 0.0, egui::Slider::new(&mut position, 0.0..=duration.max(0.01)).show_value(false).trailing_fill(true)).accessible_name(text("Положение видео", "Video position", "Posición del vídeo")).changed()
                             && let Err(problem) = player.seek(position) { error = Some(problem); }
+                        ui.horizontal(|ui| {
+                            let keyboard_available = !ui.ctx().egui_wants_keyboard_input();
+                            let key_pressed = |key| keyboard_available && ui.input(|input| input.key_pressed(key));
+                            let rewind_key = key_pressed(egui::Key::ArrowLeft);
+                            let forward_key = key_pressed(egui::Key::ArrowRight);
+                            let rewind = ui.add_enabled(duration > 0.0, Button::new(text("−5 с", "−5 s", "−5 s")))
+                                .accessible_name(text("Назад на 5 секунд", "Back 5 seconds", "Retroceder 5 segundos"))
+                                .on_hover_text(text("Назад на 5 секунд · ←", "Back 5 seconds · ←", "Retroceder 5 segundos · ←"));
+                            let forward = ui.add_enabled(duration > 0.0, Button::new(text("+5 с", "+5 s", "+5 s")))
+                                .accessible_name(text("Вперёд на 5 секунд", "Forward 5 seconds", "Avanzar 5 segundos"))
+                                .on_hover_text(text("Вперёд на 5 секунд · →", "Forward 5 seconds · →", "Avanzar 5 segundos · →"));
+                            let offset = 5.0 * (i32::from(forward.clicked() || forward_key) - i32::from(rewind.clicked() || rewind_key)) as f64;
+                            if duration > 0.0 && offset != 0.0 && let Err(problem) = player.seek((position + offset).clamp(0.0, duration)) { error = Some(problem); }
+                        });
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             let label = if player.playing() { text("Пауза", "Pause", "Pausa") } else { text("Воспроизвести", "Play", "Reproducir") };
@@ -1451,7 +1611,7 @@ impl App {
             ui.label(path.file_name().unwrap_or_default().to_string_lossy());
             ui.add_space(10.0);
             let available = ui.available_size();
-            let height = (available.x * 9.0 / 16.0).min((available.y - 235.0).max(80.0));
+            let height = (available.x * 9.0 / 16.0).min((available.y - 300.0).max(80.0));
             let (preview, _) = ui.allocate_exact_size(vec2(available.x, height), Sense::hover());
             ui.painter().rect_filled(preview, 4.0, Color32::BLACK);
             let scale = ui.ctx().pixels_per_point();
@@ -1461,7 +1621,7 @@ impl App {
             ui.horizontal(|ui| {
                 let label = if player.playing() { text("Пауза", "Pause", "Pausa") } else { text("Воспроизвести", "Play", "Reproducir") };
                 if ui.add_sized([110.0, 36.0], Button::new(label)).clicked() && let Err(problem) = player.toggle() { error = Some(problem); }
-                ui.label(format!("{} / {}", player_time(position), player_time(duration)));
+                ui.label(format!("{} / {}", trim_time((position * 1000.0).round() as u64), player_time(duration)));
                 ui.spacing_mut().slider_width = (ui.available_width() - 145.0).max(40.0);
                 if ui.add_enabled(duration > 0.0, egui::Slider::new(&mut position, 0.0..=duration.max(0.01)).show_value(false)).accessible_name(text("Положение видео", "Video position", "Posición del vídeo")).changed()
                     && let Err(problem) = player.seek(position) { error = Some(problem); }
@@ -1502,28 +1662,48 @@ impl App {
                     ui.painter().line_segment([pos2(x + offset, timeline.center().y - 7.0), pos2(x + offset, timeline.center().y + 7.0)], Stroke::new(1.5, GREY8));
                 }
                 let response = ui.interact(handle, ui.scope_id().with(id), Sense::drag());
-                if response.dragged() && let Some(pointer) = response.interact_pointer_pos() {
+                if duration > 0.0 && response.dragged() && let Some(pointer) = response.interact_pointer_pos() {
                     let value = ((((pointer.x - timeline.left()) / timeline.width()).clamp(0.0, 1.0) as f64) * max_ms as f64).round() as u64;
                     if is_start { start = value.min(end.saturating_sub(1)); *start_text = trim_time(start); }
                     else { end = value.clamp(start + 1, max_ms); *end_text = trim_time(end); }
-                    if let Err(problem) = player.seek((if is_start { start } else { end }) as f64 / 1000.0) { error = Some(problem); }
+                    if let Err(problem) = player.seek(((if is_start { start } else { end }) as f64 / 1000.0).min(duration)) { error = Some(problem); }
                 }
             }
             let play_x = timeline.left() + timeline.width() * (position / duration.max(0.01)).clamp(0.0, 1.0) as f32;
             ui.painter().line_segment([pos2(play_x, timeline.top()), pos2(play_x, timeline.bottom())], Stroke::new(2.0, Color32::WHITE));
             ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                let start_label = ui.label(text("Начало", "Start", "Inicio"));
-                if ui.add(egui::TextEdit::singleline(start_text).desired_width(100.0)).labelled_by(start_label.id).changed()
-                    && let Some(ms) = parse_trim_time(start_text) && ms as f64 <= duration * 1000.0
-                    && let Err(problem) = player.seek(ms as f64 / 1000.0) { error = Some(problem); }
-                let end_label = ui.label(text("Конец", "End", "Fin"));
-                if ui.add(egui::TextEdit::singleline(end_text).desired_width(100.0)).labelled_by(end_label.id).changed()
-                    && let Some(ms) = parse_trim_time(end_text) && ms as f64 <= duration * 1000.0
-                    && let Err(problem) = player.seek(ms as f64 / 1000.0) { error = Some(problem); }
-                ui.label(format!("{} {}", text("Длительность", "Duration", "Duración"), trim_time(end - start)));
-            });
-            ui.label(RichText::new(text("Время — минуты:секунды.миллисекунды. Оригинал для восстановления хранится в скрытой папке .opnoverlay-originals и занимает место.", "Time: minutes:seconds.milliseconds. The original is kept in the hidden .opnoverlay-originals folder and uses disk space.", "Tiempo: minutos:segundos.milisegundos. El original se guarda en la carpeta oculta .opnoverlay-originals y ocupa espacio.")).size(12.0).color(TEXT_MUTED));
+            for (label, value, bounds) in [
+                (text("Начало", "Start", "Inicio"), &mut *start_text, 0..=end - 1),
+                (text("Конец", "End", "Fin"), &mut *end_text, start + 1..=max_ms),
+            ] {
+                ui.horizontal_wrapped(|ui| {
+                    let name = ui.add_sized([56.0, 22.0], egui::Label::new(label));
+                    let edited = ui.add(egui::TextEdit::singleline(value).desired_width(75.0).background_color(GREY7)).labelled_by(name.id).changed();
+                    let current = parse_trim_time(value).filter(|ms| bounds.contains(ms));
+                    let mut adjusted = None;
+                    for (caption, amount) in [(text("−10 мс", "−10 ms", "−10 ms"), -10_i64), (text("+10 мс", "+10 ms", "+10 ms"), 10)] {
+                        if ui.add_enabled(duration > 0.0 && current.is_some(), Button::new(caption))
+                            .accessible_name(format!("{label} {caption}")).clicked() {
+                            adjusted = current.map(|ms| ms.saturating_add_signed(amount));
+                        }
+                    }
+                    let playhead = (position * 1000.0).round() as u64;
+                    let from_position = text("С позиции", "Use cursor", "Usar cursor");
+                    if ui.add_enabled(duration > 0.0 && bounds.contains(&playhead), Button::new(from_position))
+                        .accessible_name(format!("{label} · {from_position}")).clicked() {
+                        adjusted = Some(playhead);
+                    }
+                    let preview = adjusted.map(|ms| ms.clamp(*bounds.start(), *bounds.end()));
+                    if let Some(ms) = preview { *value = trim_time(ms); }
+                    if let Some(ms) = preview.or(current.filter(|_| edited && duration > 0.0))
+                        && let Err(problem) = player.seek((ms as f64 / 1000.0).min(duration)) { error = Some(problem); }
+                });
+            }
+            let length = parse_trim_time(start_text).zip(parse_trim_time(end_text))
+                .filter(|(start, end)| start < end && *end <= max_ms)
+                .map_or_else(|| "—".into(), |(start, end)| trim_time(end - start));
+            ui.label(RichText::new(format!("{} {length}", text("Длительность фрагмента", "Selection duration", "Duración de la selección"))).color(TEXT_MUTED));
+            ui.label(RichText::new(text("Метки в миллисекундах. Экспорт по границам кадров. Исходник хранится для восстановления.", "Markers use milliseconds. Export uses frame boundaries. The original is kept for restoration.", "Las marcas están en milisegundos. Se exporta por fotogramas y se conserva el original.")).size(12.0).color(TEXT_MUTED));
             if let Some(error) = &current_error { ui.colored_label(RED, error); }
             ui.horizontal_wrapped(|ui| {
                 if ui.add_sized([120.0, 36.0], Button::new(text("Отмена", "Cancel", "Cancelar"))).clicked() { close = true; }
@@ -1681,11 +1861,28 @@ impl App {
                         ui.separator();
                         ui.add_space(10.0);
                         ui.label(RichText::new(text("ГАЛЕРЕЯ", "GALLERY", "GALERÍA")).size(12.0).strong().color(TEXT_MUTED));
-                        ui.label(RichText::new(text("Последние файлы", "Recent files", "Archivos recientes")).size(15.0));
+                        ui.horizontal(|ui| {
+                            let search = ui.label(text("Поиск по имени", "Search by name", "Buscar por nombre"));
+                            let width = (ui.available_width() - 80.0).max(70.0);
+                            let input = egui::TextEdit::singleline(&mut self.gallery_query).desired_width(width)
+                                .background_color(GREY7).hint_text(text("Например, replay", "Example: replay", "Ejemplo: replay"));
+                            let edited = ui.add(input).labelled_by(search.id).changed();
+                            let clear = !self.gallery_query.is_empty() && ui.button(text("Сбросить", "Clear", "Borrar")).clicked();
+                            if clear { self.gallery_query.clear(); }
+                            if edited || clear { self.gallery_limit = GALLERY_PAGE_SIZE; }
+                        });
                         ui.add_space(6.0);
-                        let files: Vec<_> = self.config.gallery_files.iter().rev().filter(|path| path.is_file()).take(20).cloned().collect();
+                        let query = self.gallery_query.trim().to_lowercase();
+                        let mut files = gallery_matches(&self.config.gallery_files, &query, self.gallery_limit + 1);
+                        let has_more = files.len() > self.gallery_limit;
+                        files.truncate(self.gallery_limit);
                         if files.is_empty() {
-                            ui.label(RichText::new(text("Сохранённые откаты, записи и скриншоты появятся здесь.", "Saved replays, recordings and screenshots appear here.", "Aquí aparecerán las repeticiones, grabaciones y capturas guardadas.")).color(TEXT_MUTED));
+                            let label = if query.is_empty() {
+                                text("Сохранённые откаты, записи и скриншоты появятся здесь.", "Saved replays, recordings and screenshots appear here.", "Aquí aparecerán las repeticiones, grabaciones y capturas guardadas.")
+                            } else {
+                                text("Совпадений нет. Попробуй часть имени файла.", "No matches. Try part of a file name.", "Sin resultados. Prueba con parte del nombre.")
+                            };
+                            ui.label(RichText::new(label).color(TEXT_MUTED));
                         }
                         self.update_gallery_thumbnails(&ctx, &files);
                         let side = ((ui.available_width() - 16.0) / 3.0).clamp(72.0, 150.0);
@@ -1695,6 +1892,9 @@ impl App {
                                 if index % 3 == 2 { ui.end_row(); }
                             }
                         });
+                        if has_more && ui.button(text("Показать ещё", "Show more", "Mostrar más")).clicked() {
+                            self.gallery_limit += GALLERY_PAGE_SIZE;
+                        }
                     });
                 });
                 ui.separator();
@@ -1721,19 +1921,24 @@ impl App {
     }
 
     fn show_performance_hud(&self, ctx: &egui::Context) {
-        if !self.config.hud_enabled || !self.config.setup_complete {
+        let count = [
+            cfg!(windows) && self.config.hud_fps, cfg!(windows) && self.config.hud_frame_time,
+            self.config.hud_cpu, self.config.hud_memory, cfg!(windows) && self.config.hud_gpu,
+            cfg!(windows) && self.config.hud_gpu_temperature, cfg!(windows) && self.config.hud_video_memory,
+        ].into_iter().filter(|enabled| *enabled).count();
+        if self.exit_requested || !self.config.hud_enabled || !self.config.setup_complete || count == 0 {
             #[cfg(windows)]
             if let Ok(mut meter) = self.hud_meter.lock() { meter.gpu_receiver = None; meter.gpu = None; meter.fps_monitor = None; meter.fps = None; }
             return;
         }
-        let count = [cfg!(windows) && self.config.hud_fps, self.config.hud_cpu, self.config.hud_memory, cfg!(windows) && self.config.hud_gpu, cfg!(windows) && self.config.hud_gpu_temperature, cfg!(windows) && self.config.hud_video_memory].into_iter().filter(|enabled| *enabled).count();
-        let height = (16.0 + count as f32 * 20.0).max(36.0);
+        let scale = self.config.hud_size.scale();
+        let size = vec2(190.0 * scale, (16.0 + count as f32 * 20.0).max(36.0) * scale);
         let monitor = ctx.input(|i| i.viewport().monitor_size).unwrap_or(vec2(1920.0, 1080.0));
-        let position = hud_position(self.config.hud_corner, monitor, height);
+        let position = hud_position(self.config.hud_corner, monitor, size);
         let builder = egui::ViewportBuilder::default()
             .with_title("opnoverlay metrics")
             .with_position(position)
-            .with_inner_size([190.0, height])
+            .with_inner_size(size)
             .with_decorations(false)
             .with_resizable(false)
             .with_taskbar(false)
@@ -1747,7 +1952,12 @@ impl App {
         #[cfg(windows)]
         let (show_gpu, show_gpu_temperature, show_video_memory) = (self.config.hud_gpu, self.config.hud_gpu_temperature, self.config.hud_video_memory);
         #[cfg(windows)]
-        let show_fps = self.config.hud_fps;
+        let (show_fps, show_frame_time) = (self.config.hud_fps, self.config.hud_frame_time);
+        #[cfg(windows)]
+        let fps_target = match self.selected {
+            Some(SourceId::Window(window)) => crate::platform::fps::window_process(windows::Win32::Foundation::HWND(window as *mut _)),
+            _ => None,
+        };
         ctx.show_viewport_deferred(egui::ViewportId::from_hash_of("performance-hud"), builder, move |ui, _| {
             crate::platform::sys::prepare_hud_window("opnoverlay metrics", hide_from_capture);
             let mut meter = meter.lock().unwrap();
@@ -1755,40 +1965,51 @@ impl App {
             #[cfg(windows)]
             meter.update_gpu(show_gpu || show_gpu_temperature || show_video_memory);
             #[cfg(windows)]
-            meter.update_fps(show_fps);
-            egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_black_alpha(190)).inner_margin(8)).show(ui, |ui| {
+            meter.update_fps(show_fps || show_frame_time, fps_target);
+            #[cfg(windows)]
+            let timing = meter.fps.and_then(|sample| sample.current(fps_target));
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_black_alpha(190)).inner_margin(8.0 * scale)).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 3.0 * scale;
                 #[cfg(windows)]
                 if show_fps {
-                    let value = meter.fps.filter(|(at, _)| at.elapsed() < Duration::from_secs(4)).and_then(|(_, value)| value).map_or_else(|| "—".to_owned(), |value| format!("{value:.0}"));
-                    ui.label(RichText::new(format!("FPS  {value}")).color(Color32::WHITE).size(14.0));
+                    let value = timing.map_or_else(|| "—".to_owned(), |timing| format!("{:.0}", timing.fps()));
+                    ui.label(RichText::new(format!("FPS  {value}")).color(Color32::WHITE).size(14.0 * scale));
+                }
+                #[cfg(windows)]
+                if show_frame_time {
+                    let (label, unit) = match language {
+                        Language::Russian => ("Время кадра", "мс"),
+                        Language::English => ("Frame time", "ms"),
+                        Language::Spanish => ("Tiempo de fotograma", "ms"),
+                    };
+                    let value = timing.map_or_else(|| "—".to_owned(), |timing| format!("{:.1} {unit}", timing.frame_ms));
+                    ui.label(RichText::new(format!("{label}  {value}")).color(Color32::WHITE).size(14.0 * scale));
                 }
                 if show_cpu {
                     let value = meter.cpu_percent.map_or_else(|| "—".to_owned(), |value| format!("{value:.0}%"));
-                    ui.label(RichText::new(format!("CPU  {value}")).color(Color32::WHITE).size(14.0));
+                    ui.label(RichText::new(format!("CPU  {value}")).color(Color32::WHITE).size(14.0 * scale));
                 }
                 if show_memory {
                     let unit = if language == Language::Russian { "ГиБ" } else { "GiB" };
                     let name = if language == Language::Russian { "ОЗУ" } else { "RAM" };
                     let value = meter.memory.map_or_else(|| "—".to_owned(), |(used, total)| format!("{:.1} / {:.1} {unit}", used as f64 / 1_073_741_824.0, total as f64 / 1_073_741_824.0));
-                    ui.label(RichText::new(format!("{name}  {value}")).color(Color32::WHITE).size(14.0));
+                    ui.label(RichText::new(format!("{name}  {value}")).color(Color32::WHITE).size(14.0 * scale));
                 }
                 #[cfg(windows)]
-                if show_gpu {
-                    let value = meter.gpu.and_then(|gpu| gpu.utilization).map_or_else(|| "—".to_owned(), |value| format!("{value}%"));
-                    ui.label(RichText::new(format!("GPU NVIDIA  {value}")).color(Color32::WHITE).size(14.0));
+                if show_gpu && let Some(value) = meter.gpu.and_then(|gpu| gpu.utilization) {
+                    ui.label(RichText::new(format!("GPU NVIDIA  {value}%")).color(Color32::WHITE).size(14.0 * scale));
                 }
                 #[cfg(windows)]
-                if show_gpu_temperature {
-                    let value = meter.gpu.and_then(|gpu| gpu.temperature).map_or_else(|| "—".to_owned(), |value| format!("{value} °C"));
+                if show_gpu_temperature && let Some(value) = meter.gpu.and_then(|gpu| gpu.temperature) {
                     let name = if language == Language::Russian { "GPU температура" } else { "GPU temp" };
-                    ui.label(RichText::new(format!("{name}  {value}")).color(Color32::WHITE).size(14.0));
+                    ui.label(RichText::new(format!("{name}  {value} °C")).color(Color32::WHITE).size(14.0 * scale));
                 }
                 #[cfg(windows)]
-                if show_video_memory {
+                if show_video_memory && let Some((used, total)) = meter.gpu.and_then(|gpu| gpu.memory) {
                     let unit = if language == Language::Russian { "ГиБ" } else { "GiB" };
                     let name = if language == Language::Russian { "Видеопамять" } else { "VRAM" };
-                    let value = meter.gpu.and_then(|gpu| gpu.memory).map_or_else(|| "—".to_owned(), |(used, total)| format!("{:.1} / {:.1} {unit}", used as f64 / 1_073_741_824.0, total as f64 / 1_073_741_824.0));
-                    ui.label(RichText::new(format!("{name}  {value}")).color(Color32::WHITE).size(14.0));
+                    let value = format!("{:.1} / {:.1} {unit}", used as f64 / 1_073_741_824.0, total as f64 / 1_073_741_824.0);
+                    ui.label(RichText::new(format!("{name}  {value}")).color(Color32::WHITE).size(14.0 * scale));
                 }
             });
             ui.ctx().request_repaint_after(Duration::from_secs(1));
@@ -1985,39 +2206,62 @@ impl App {
 
     /// Saves the newest frame of the current source as a PNG in the recordings folder.
     fn take_screenshot(&mut self, ctx: &egui::Context) {
-        let Some(session) = self.active_session().or(self.preview.as_ref()) else {
-            return self.set_status(tr!("Añade una fuente con el botón + del panel Fuentes.", "Add a source with the + button in the Sources dock."), None, true);
-        };
         if let Some(problem) = Self::output_dir_problem(&self.config.output_dir) {
             return self.set_status(problem, None, true);
         }
-        let (mut width, mut height, mut rgba) = match session.snapshot() {
-            Ok(image) => image,
-            Err(e) => return self.set_status(tr3!("No se pudo hacer la captura: {}", "Could not take the screenshot: {}", "Не удалось сделать скриншот: {}", e), None, true),
+        let session = self.active_session().or(self.preview.as_ref());
+        #[cfg(windows)]
+        let Some(source) = self.selected else {
+            return self.set_status(tr3!("Selecciona una pantalla o ventana en los ajustes de vídeo.", "Select a display or window in video settings.", "Выбери экран или окно в настройках видео."), None, true);
         };
-        if let Some(region) = self.config.region.and_then(|r| r.fit((width, height))) {
-            rgba = capture::crop_rgba(&rgba, width, region);
-            (width, height) = (region.width, region.height);
-        }
-        if let (Some((corner, size)), Some(camera)) = (self.overlay(), self.camera.as_ref())
-            && let Some(frame) = camera.shared.latest.lock().unwrap().clone()
-        {
-            paste_camera(&mut rgba, width, height, &frame, corner, size);
-        }
+        #[cfg(not(windows))]
+        let Some(session) = session else {
+            return self.set_status(tr!("Añade una fuente con el botón + del panel Fuentes.", "Add a source with the + button in the Sources dock."), None, true);
+        };
+        #[cfg(windows)]
+        let (images, cursor, desktop_duplication) = (session.map(|session| session.shared.clone()), self.config.cursor, self.config.desktop_duplication);
+        #[cfg(windows)]
+        let display_canvas = self.capture_display_canvas();
+        #[cfg(not(windows))]
+        let image = session.snapshot();
+        let region = self.config.region;
+        let camera = self.overlay().zip(self.camera.as_ref().and_then(|camera| camera.shared.latest.lock().unwrap().clone()));
         let format = self.config.screenshot_format;
         let quality = self.config.jpeg_quality;
         let path = new_output(&self.config.output_dir, Some("Screenshot"), format.extension(), &mut self.named);
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
-        // PNG encoding of a large frame takes a moment; keep the UI responsive.
         thread::spawn(move || {
-            let result = std::fs::create_dir_all(path.parent().unwrap_or(&path))
-                .map_err(|e| e.to_string())
-                .and_then(|()| capture::write_screenshot_unique(&path, format, width, height, &rgba, quality));
+            #[cfg(windows)]
+            let image = images.map_or_else(|| capture::snapshot_once(source, cursor, desktop_duplication), |shared| shared.await_snapshot());
+            let result = image.and_then(|(mut width, mut height, mut rgba)| {
+                #[cfg(windows)]
+                if let Some((w, h)) = display_canvas.filter(|size| *size != (width, height)) {
+                    let pixels = image::RgbaImage::from_raw(width, height, rgba).ok_or("invalid screenshot buffer")?;
+                    rgba = image::imageops::resize(&pixels, w, h, image::imageops::FilterType::Triangle).into_raw();
+                    (width, height) = (w, h);
+                }
+                if let Some(region) = region.and_then(|r| r.fit((width, height))) {
+                    rgba = capture::crop_rgba(&rgba, width, region);
+                    (width, height) = (region.width, region.height);
+                }
+                if let Some(((corner, size), frame)) = camera { paste_camera(&mut rgba, width, height, &frame, corner, size); }
+                std::fs::create_dir_all(path.parent().unwrap_or(&path)).map_err(|e| e.to_string())?;
+                capture::write_screenshot_unique(&path, format, width, height, &rgba, quality)
+            });
             let _ = tx.send(result);
             ctx.request_repaint();
         });
         self.screenshots.push(rx);
+    }
+
+    #[cfg(windows)]
+    fn capture_display_canvas(&self) -> Option<(u32, u32)> {
+        if self.config.stretch_display && self.config.region.is_none() {
+            self.selected.and_then(capture::desktop_resolution)
+        } else {
+            None
+        }
     }
 
     #[cfg(windows)]
@@ -2028,31 +2272,83 @@ impl App {
         let restored = available && !self.desktop_available;
         self.desktop_available = available;
         if restored { self.restore_capture_after_desktop_change(ctx); }
+        if available {
+            self.check_selected_display(ctx);
+            if self.active_session().is_some_and(Session::duplication_mode_changed) {
+                self.restore_capture_after_desktop_change(ctx);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn check_selected_display(&mut self, ctx: &egui::Context) {
+        let Some(SourceId::Monitor(display)) = self.selected else { return };
+        if crate::platform::sys::display_bounds(display).is_some() { return; }
+        self.selected = None;
+        self.preview = None;
+        self.texture = None;
+        self.texture_seq = None;
+        self.refresh_sources();
+        if self.config.source_display.is_none() { self.config.region = None; }
+        let message = tr3!(
+            "La pantalla de captura se desconectó. Comprueba la fuente antes de volver a grabar.",
+            "The capture display was disconnected. Check the source before recording again.",
+            "Экран захвата отключился. Проверь источник перед возобновлением записи."
+        );
+        if self.is_session_active() { self.stop_session(ctx, Some(message.into())); }
+        else { self.set_status(message, None, true); }
     }
 
     #[cfg(windows)]
     fn restore_capture_after_desktop_change(&mut self, ctx: &egui::Context) {
-        let recording = self.is_recording();
-        let replay = self.is_replaying();
-        let paused = self.is_paused();
-        if self.is_session_active() {
-            if recording { self.desktop_resume = Some((recording, replay, paused)); }
-            self.stop_session(ctx, None);
-            self.refresh_sources();
-            if !recording && replay {
-                self.start_replay(ctx);
-            }
-            if recording { self.notify(tr3!("Restableciendo captura; la grabación continuará en otro archivo", "Restoring capture; recording will continue in a new file", "Восстанавливаем захват; запись продолжится в новом файле"), true); }
-        } else if !matches!(self.rec, RecState::Saving(_)) {
+        if let RecState::Active { source, session, .. } = &self.rec {
+            self.desktop_resume = Some(CaptureResume {
+                source: Some(source.clone()),
+                recording: self.is_recording(),
+                replay: self.is_replaying(),
+                paused: self.is_paused(),
+                not_before: session.uses_duplication().then(|| Instant::now() + Duration::from_millis(750)),
+            });
+            let reason = self.is_recording().then(|| tr3!("Cambió el escritorio activo.", "The active desktop changed.", "Активный рабочий стол изменился.").into());
+            self.stop_session(ctx, reason);
+        }
+        if !self.desktop_available || matches!(self.rec, RecState::Saving(_)) { return; }
+        if self.desktop_resume.is_some() {
+            self.resume_pending_capture(ctx);
+        } else {
             self.refresh_sources();
             self.restart_preview(ctx);
-            if let Some((recording, replay, paused)) = self.desktop_resume.take() {
-                if replay { self.start_replay(ctx); }
-                if recording { self.start_recording(ctx); }
-                if paused && self.is_recording() && let Some(session) = self.active_session() {
-                    session.shared.outputs.lock().unwrap().set_file_paused(true);
-                }
+        }
+    }
+
+    #[cfg(windows)]
+    fn resume_pending_capture(&mut self, ctx: &egui::Context) {
+        if let Some(delay) = self.desktop_resume.as_ref().and_then(|resume| resume.not_before)
+            .and_then(|not_before| not_before.checked_duration_since(Instant::now()))
+        {
+            ctx.request_repaint_after(delay);
+            return;
+        }
+        let Some(resume) = self.desktop_resume.take() else { return };
+        if let Some(source) = resume.source {
+            self.sources = capture::list_sources();
+            self.selected = self.sources.iter().map(|source| source.id).find(|id| source.matches(*id));
+            if self.selected.is_none() {
+                self.restart_preview(ctx);
+                self.set_status(tr3!(
+                    "No se reanudó la captura porque la fuente anterior ya no está disponible.",
+                    "Capture did not resume because the previous source is unavailable.",
+                    "Захват приостановлен: прежний источник недоступен."
+                ), None, true);
+                return;
             }
+        } else {
+            self.refresh_sources();
+        }
+        if resume.replay { self.start_replay(ctx); }
+        if resume.recording { self.start_recording(ctx); }
+        if resume.paused && self.is_recording() && let Some(session) = self.active_session() {
+            session.shared.outputs.lock().unwrap().set_file_paused(true);
         }
     }
 
@@ -2131,11 +2427,11 @@ impl App {
         }
         #[cfg(windows)]
         if self.selected_audio_only() {
-            use crate::platform::audio::selected::CaptureState;
+            self.poll_selected_audio();
             let stopped = self.selected_audio.iter_mut().find_map(|input| {
                 if input.reported { return None; }
                 let problem = match input.state() {
-                    CaptureState::Exited => Some(tr3!("La aplicación terminó; vuelve a seleccionarla.", "The application exited; select it again.", "Приложение закрылось; выберите его заново.").to_owned()),
+                    CaptureState::Exited => Some(tr3!("La aplicación terminó. Vuelve a conectarla desde Pantalla y sonido.", "The application exited. Reconnect it in Screen and sound.", "Приложение закрылось. Переподключите его в разделе «Экран и звук».").to_owned()),
                     CaptureState::Failed(error) => Some(tr3!("Error de audio de la aplicación: {}", "Application audio error: {}", "Ошибка звука приложения: {}", error)),
                     _ => None,
                 };
@@ -2198,31 +2494,21 @@ impl App {
             RecState::Saving(rx) => match rx.try_recv() {
                 Ok(result) => Some(result),
                 Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => Some(Err("обработчик сохранения завершился".into())),
+                Err(mpsc::TryRecvError::Disconnected) => Some(failed(tr3!("El proceso de guardado se cerró.", "The recording saver stopped.", "Обработчик сохранения завершился.").into())),
             },
             _ => None,
         };
-        if let Some(result) = saved_recording {
+        if let Some(status) = saved_recording {
             self.rec = RecState::Idle;
             // Before the status: if the source is gone, its error must not hide where the file went.
             if self.preview.is_none() {
                 self.restart_preview(ctx);
             }
-            match result {
-                Ok(path) => self.show_recording_saved(recording_saved(path)),
-                Err(e) => self.set_status(tr!("Error al guardar la grabación: {}", "Error saving the recording: {}", e), None, true),
-            }
-            #[cfg(windows)]
-            if self.desktop_available && !self.exit_requested
-                && let Some((recording, replay, paused)) = self.desktop_resume.take()
-            {
-                self.refresh_sources();
-                if replay { self.start_replay(ctx); }
-                if recording { self.start_recording(ctx); }
-                if paused && self.is_recording() && let Some(session) = self.active_session() {
-                    session.shared.outputs.lock().unwrap().set_file_paused(true);
-                }
-            }
+            self.show_recording_saved(status);
+        }
+        #[cfg(windows)]
+        if self.desktop_available && !self.exit_requested && matches!(self.rec, RecState::Idle) {
+            self.resume_pending_capture(ctx);
         }
 
         for rx in std::mem::take(&mut self.screenshots) {
@@ -2254,10 +2540,20 @@ impl App {
             return self.stop_recording(ctx);
         }
         if self.active_session().is_some_and(Session::is_finished) {
+            #[cfg(windows)]
+            {
+                self.desktop_available = crate::platform::sys::interactive_desktop_available();
+                if !self.desktop_available || self.active_session().is_some_and(Session::restart_required) {
+                    self.restore_capture_after_desktop_change(ctx);
+                    return;
+                }
+                self.check_selected_display(ctx);
+                if self.active_session().is_none() { return; }
+            }
             let reason = if self.is_recording() {
-                tr!("La fuente dejó de estar disponible; guardando…", "The source is no longer available; saving…")
+                tr3!("La fuente de captura dejó de estar disponible.", "The capture source became unavailable.", "Источник захвата стал недоступен.")
             } else {
-                tr!("La fuente dejó de estar disponible; búfer de repetición detenido.", "The source is no longer available; replay buffer stopped.")
+                tr3!("La fuente dejó de estar disponible. Se detuvo el búfer de repetición.", "The source became unavailable. The replay buffer stopped.", "Источник захвата стал недоступен. Буфер откатов остановлен.")
             };
             return self.stop_session(ctx, Some(reason.into()));
         }
@@ -2515,8 +2811,6 @@ impl App {
 
     #[cfg(windows)]
     fn selected_audio_controls(&mut self, ui: &mut egui::Ui) {
-        use crate::platform::audio::selected::{self, CaptureState, SelectedInput, SelectedProcess};
-
         let can_change = matches!(self.rec, RecState::Idle) && self.jobs.is_empty();
         let mut selected_only = self.config.selected_audio_only;
         let mode = ui.add_enabled(can_change, egui::Checkbox::new(&mut selected_only, tr3!(
@@ -2540,31 +2834,6 @@ impl App {
         if !selected_only {
             return;
         }
-        if let Some(receiver) = &self.selected_audio_menu {
-            match receiver.try_recv() {
-                Ok(choices) => {
-                    self.selected_audio_choices = choices;
-                    self.selected_audio_menu = None;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => self.selected_audio_menu = None,
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
-        if let Some(receiver) = &self.selected_audio_add {
-            match receiver.try_recv() {
-                Ok(Ok(input)) => {
-                    self.selected_audio.push(input);
-                    self.selected_audio_add = None;
-                    self.sync_mixer_inputs();
-                }
-                Ok(Err(error)) => {
-                    self.selected_audio_add = None;
-                    self.set_status(error, None, true);
-                }
-                Err(mpsc::TryRecvError::Disconnected) => self.selected_audio_add = None,
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
         if self.selected_audio.is_empty() {
             ui.colored_label(YELLOW, tr3!(
                 "No hay aplicaciones seleccionadas: solo se grabará el micrófono, si está activado.",
@@ -2573,101 +2842,151 @@ impl App {
             ));
         }
         ui.label(tr3!(
-            "El micrófono puede recoger sonidos del entorno. Selecciona cada instancia después de reiniciarla.",
-            "The microphone can pick up surrounding audio. Select each application instance again after it restarts.",
-            "Микрофон может записать звук из помещения. После перезапуска выберите экземпляр приложения снова."
+            "Confirma el nuevo proceso al volver a conectar. El micrófono puede recoger sonidos del entorno.",
+            "Confirm the new process when reconnecting. The microphone can pick up surrounding sound.",
+            "При переподключении выберите новый процесс. Микрофон может улавливать звук из помещения."
         ));
-        let menu = ui.add_enabled_ui(can_change && self.selected_audio_add.is_none(), |ui| {
-            ui.menu_button(tr3!("Elegir aplicación", "Select application", "Выбрать приложение"), |ui| {
-                if self.selected_audio_menu.is_some() {
-                    ui.spinner();
-                } else if self.selected_audio_choices.is_empty() {
-                    ui.label(tr3!("No hay aplicaciones disponibles", "No applications available", "Нет доступных приложений"));
-                }
-                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                    for (title, process) in &self.selected_audio_choices {
-                        if ui.button(format!("{title} · PID {}", process.id.pid))
-                            .on_hover_text(process.path.display().to_string()).clicked()
-                        {
-                            ui.close();
-                            return Some(process.clone());
-                        }
+        let available = self.selected_audio_add.is_none();
+        let mut refresh = false;
+        let mut connection = None;
+        let mut remove = None;
+        ui.add_enabled_ui(can_change && available, |ui| {
+            let (opened, process) = selected_audio_picker(
+                ui, tr3!("Elegir aplicación", "Select application", "Выбрать приложение"),
+                &self.selected_audio_choices, self.selected_audio_menu.is_some(), None,
+            );
+            refresh |= opened;
+            if let Some(process) = process { connection = Some((None, process)); }
+        });
+        for (index, input) in self.selected_audio.iter_mut().enumerate() {
+            ui.push_id(index, |ui| {
+                ui.separator();
+                let label = input.process.path.file_name().unwrap_or_default().to_string_lossy();
+                let state = match input.state() {
+                    CaptureState::Starting => tr3!("Conectando", "Connecting", "Подключение"),
+                    CaptureState::Active => tr3!("Activo", "Active", "Активно"),
+                    CaptureState::Exited => tr3!("Finalizado", "Exited", "Процесс завершён"),
+                    CaptureState::Failed(error) => {
+                        ui.label(RichText::new(tr3!("Error", "Error", "Ошибка")).color(RED)).on_hover_text(error);
+                        ""
                     }
-                    None
-                }).inner
-            })
-        }).inner;
-        if menu.response.clicked() && self.selected_audio_menu.is_none() {
-            let (sender, receiver) = mpsc::channel();
-            self.selected_audio_choices.clear();
-            self.selected_audio_menu = Some(receiver);
-            let ctx = self.ctx.clone();
-            thread::spawn(move || {
-                let choices = crate::platform::capture::list_audio_instances().into_iter()
-                    .filter_map(|app| Some((format!("{} · {}", app.exe, app.title), Arc::new(SelectedProcess::open(app.pid).ok()?))))
-                    .collect();
-                let _ = sender.send(choices);
-                ctx.request_repaint();
-            });
-        }
-        if let Some(Some(process)) = menu.inner {
-            let (sender, receiver) = mpsc::channel();
-            self.selected_audio_add = Some(receiver);
-            let current: Vec<_> = self.selected_audio.iter().map(|input| input.process.clone()).collect();
-            let ctx = self.ctx.clone();
-            let overlap = tr3!(
-                "No se puede verificar que los árboles de procesos sean independientes.",
-                "The process trees could not be verified as independent.",
-                "Не удалось подтвердить, что деревья процессов независимы."
-            ).to_owned();
-            thread::spawn(move || {
-                let result = (|| {
-                    if !process.alive().map_err(|e| e.to_string())? {
-                        return Err("The selected process has already exited".to_owned());
-                    }
-                    for other in current {
-                        if other.alive().map_err(|e| e.to_string())?
-                            && selected::overlaps(other.id, process.id).map_err(|e| e.to_string())?
-                        {
-                            return Err(overlap);
-                        }
-                    }
-                    SelectedInput::start(process, 1.0, ctx.clone()).map_err(|e| e.to_string())
-                })();
-                let _ = sender.send(result);
-                ctx.request_repaint();
-            });
-        }
-        egui::ScrollArea::vertical().max_height(100.0).show(ui, |ui| {
-            let mut remove = None;
-            for (index, input) in self.selected_audio.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    let label = input.process.path.file_name().unwrap_or_default().to_string_lossy();
-                    let state = match input.state() {
-                        CaptureState::Starting => tr3!("Conectando", "Connecting", "Подключение"),
-                        CaptureState::Active => tr3!("Activo", "Active", "Активно"),
-                        CaptureState::Exited => tr3!("Finalizado", "Exited", "Процесс завершён"),
-                        CaptureState::Failed(error) => {
-                            ui.label(RichText::new(tr3!("Error", "Error", "Ошибка")).color(RED)).on_hover_text(error);
-                            ""
-                        }
-                    };
-                    ui.label(format!("{label} · {} {state}", input.process.id.pid));
-                    let mute_label = if input.muted { tr3!("Activar", "Unmute", "Включить звук") } else { tr3!("Silenciar", "Mute", "Выключить звук") };
-                    if ui.small_button(mute_label).clicked() {
-                        input.muted = !input.muted;
-                        input.shared.set_gain(channel_gain(input.volume, input.muted));
-                    }
-                    if ui.add_enabled(can_change && self.selected_audio_add.is_none(), Button::new("×").small()).clicked() {
+                };
+                ui.label(format!("{label} · PID {} · {state}", input.process.id.pid));
+                let gain = channel_gain(input.volume, input.muted);
+                let peak = input.shared.peak() * gain;
+                let level = ((20.0 * peak.max(1e-6).log10() + 60.0) / 60.0).clamp(0.0, 1.0);
+                ui.add(egui::ProgressBar::new(level).desired_height(5.0));
+                let volume_label = ui.label(tr3!("Volumen", "Volume", "Громкость"));
+                let mut percent = (input.volume * 100.0).round() as u32;
+                let changed = ui.add(Slider::new(&mut percent, 0..=100).suffix(" %")).labelled_by(volume_label.id).changed();
+                let mut toggled = false;
+                ui.horizontal_wrapped(|ui| {
+                    let mute_label = if input.muted { tr3!("Activar sonido", "Unmute", "Включить звук") } else { tr3!("Silenciar", "Mute", "Выключить звук") };
+                    toggled = ui.small_button(mute_label).clicked();
+                    if ui.add_enabled(can_change && available, Button::new(tr3!("Quitar", "Remove", "Убрать")).small()).clicked() {
                         remove = Some(index);
                     }
                 });
+                if changed { input.volume = percent as f32 / 100.0; }
+                if toggled { input.muted = !input.muted; }
+                if changed || toggled {
+                    input.shared.set_gain(channel_gain(input.volume, input.muted));
+                }
+                if input.can_reconnect() && available {
+                    let (opened, process) = selected_audio_picker(
+                        ui, tr3!("Volver a conectar", "Reconnect", "Переподключить"),
+                        &self.selected_audio_choices, self.selected_audio_menu.is_some(), Some(&input.process.path),
+                    );
+                    refresh |= opened;
+                    if let Some(process) = process { connection = Some((Some(input.process.id), process)); }
+                }
+            });
+        }
+        if refresh { self.refresh_selected_audio_choices(); }
+        if let Some((replaces, process)) = connection { self.connect_selected_audio(replaces, process); }
+        if let Some(index) = remove {
+            self.selected_audio.remove(index);
+            self.sync_mixer_inputs();
+        }
+    }
+
+    #[cfg(windows)]
+    fn refresh_selected_audio_choices(&mut self) {
+        self.selected_audio_choices.clear();
+        let (sender, receiver) = mpsc::channel();
+        self.selected_audio_menu = Some(receiver);
+        let ctx = self.ctx.clone();
+        thread::spawn(move || {
+            let choices = crate::platform::capture::list_audio_instances().into_iter()
+                .filter_map(|app| Some((format!("{} · {}", app.exe, app.title), Arc::new(SelectedProcess::open(app.pid).ok()?))))
+                .collect();
+            let _ = sender.send(choices);
+            ctx.request_repaint();
+        });
+    }
+
+    #[cfg(windows)]
+    fn connect_selected_audio(&mut self, replaces: Option<ProcessId>, process: Arc<SelectedProcess>) {
+        if let Some(id) = replaces
+            && !self.selected_audio.iter().any(|input| input.process.id == id && input.can_reconnect() && selected::same_image(&input.process.path, &process.path))
+        {
+            return;
+        }
+        let (sender, result) = mpsc::channel();
+        self.selected_audio_add = Some(PendingAudioConnection { replaces, result });
+        let current: Vec<_> = self.selected_audio.iter().filter(|input| Some(input.process.id) != replaces)
+            .map(|input| input.process.clone()).collect();
+        let ctx = self.ctx.clone();
+        let overlap = tr3!(
+            "No se puede verificar que los árboles de procesos sean independientes.",
+            "The process trees could not be verified as independent.",
+            "Не удалось подтвердить, что деревья процессов независимы."
+        ).to_owned();
+        let exited = tr3!("El proceso seleccionado ya terminó.", "The selected process has already exited.", "Выбранный процесс уже завершён.").to_owned();
+        thread::spawn(move || {
+            let result = (|| {
+                if !process.alive().map_err(|e| e.to_string())? { return Err(exited); }
+                for other in current {
+                    if other.alive().map_err(|e| e.to_string())?
+                        && selected::overlaps(other.id, process.id).map_err(|e| e.to_string())?
+                    {
+                        return Err(overlap);
+                    }
+                }
+                SelectedInput::start(process, 1.0, ctx.clone()).map_err(|e| e.to_string())
+            })();
+            let _ = sender.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    #[cfg(windows)]
+    fn poll_selected_audio(&mut self) {
+        if let Some(receiver) = self.selected_audio_menu.take() {
+            match receiver.try_recv() {
+                Ok(choices) => self.selected_audio_choices = choices,
+                Err(mpsc::TryRecvError::Empty) => self.selected_audio_menu = Some(receiver),
+                Err(mpsc::TryRecvError::Disconnected) => {}
             }
-            if let Some(index) = remove {
-                self.selected_audio.remove(index);
+        }
+        let Some(connection) = self.selected_audio_add.take() else { return };
+        match connection.result.try_recv() {
+            Ok(Ok(mut input)) => {
+                if let Some(id) = connection.replaces {
+                    let Some(old) = self.selected_audio.iter_mut().find(|old| old.process.id == id && old.can_reconnect()) else { return };
+                    input.volume = old.volume;
+                    input.muted = old.muted;
+                    input.shared.set_gain(channel_gain(input.volume, input.muted));
+                    *old = input;
+                } else {
+                    self.selected_audio.push(input);
+                }
                 self.sync_mixer_inputs();
             }
-        });
+            Ok(Err(error)) => self.set_status(error, None, true),
+            Err(mpsc::TryRecvError::Empty) => self.selected_audio_add = Some(connection),
+            Err(mpsc::TryRecvError::Disconnected) => {}
+        }
     }
 
     fn sources_dock(&mut self, ui: &mut egui::Ui) {
@@ -2823,6 +3142,10 @@ impl App {
                         format!(" ({} {}×{})", tr!("región", "region"), r.width, r.height)
                     });
                     list_row(ui, &format!("{kind}{region}  ·  {}", source.label));
+                    #[cfg(windows)]
+                    if let Some(session) = self.active_session().or(self.preview.as_ref()) {
+                        ui.label(RichText::new(session.backend_name()).small().color(TEXT_MUTED));
+                    }
                     if !self.selected_audio_only() && let Some(exe) = &self.config.app_audio {
                         ui.add_space(2.0);
                         let state = if self.app_audio.is_some() { String::new() } else { tr!(" (no se está ejecutando)", " (not running)").to_owned() };
@@ -3056,7 +3379,7 @@ impl App {
         {
             let pct = lagged as f64 * 100.0 / (encoded + lagged).max(1) as f64;
             ui.label(RichText::new(tr!("Fotogramas perdidos {} ({:.1}%)", "Dropped frames {} ({:.1}%)", lagged, pct)).small().color(YELLOW))
-                .on_hover_text(tr!("El equipo no da abasto: prueba a bajar la resolución o los FPS en Ajustes › Vídeo", "This computer can't keep up: try a lower resolution or FPS in Settings › Video"));
+                .on_hover_text(tr!("El equipo no da abasto: prueba a bajar la resolución o los FPS en Ajustes › Grabación", "This computer can't keep up: try a lower resolution or FPS in Settings › Recording"));
         }
     }
 
@@ -3066,6 +3389,12 @@ impl App {
         let recording = self.is_recording() || matches!(self.rec, RecState::Saving(_));
         let replaying = self.is_replaying();
         let source_size = self.active_session().or(self.preview.as_ref()).and_then(Session::source_size);
+        #[cfg(windows)]
+        let source_size = self.capture_display_canvas().or(source_size).or_else(|| {
+            let SourceId::Monitor(display) = self.selected? else { return None };
+            let bounds = crate::platform::sys::display_bounds(display)?;
+            Some(((bounds.right - bounds.left) as u32, (bounds.bottom - bounds.top) as u32))
+        });
         let Some(dialog) = &mut self.settings else { return };
         let language = dialog.draft.language.unwrap_or_else(Language::system);
         let text = |ru, en, es| match language { Language::Russian => ru, Language::English => en, Language::Spanish => es };
@@ -3123,6 +3452,7 @@ impl App {
                             storage_panel(ui, &mut self.storage_panel, &dialog.draft.output_dir, &self.config.gallery_files, language);
                             ui.add_space(12.0);
                         }
+                        let source_size = source_size.filter(|_| dialog.selected_source == self.selected);
                         compact_settings_page(ui, dialog, &self.system_devices, &self.mic_devices, &self.sources, source_size);
                     });
                 });
@@ -3207,8 +3537,14 @@ impl App {
                 ui.label(text("По умолчанию: 45 секунд в качестве «Максимум деталей» при 1080p и 60 FPS — около 136 МБ для видео и звука. Приложению требуется дополнительная память; фактический размер зависит от записи.", "Default: 45 seconds at maximum detail, 1080p and 60 FPS use around 136 MB for video and audio. Additional memory is required; actual size varies.", "Por defecto: 45 segundos con máximo detalle, 1080p y 60 FPS usan unos 136 MB de vídeo y audio. Se necesita memoria adicional; el tamaño real varía."));
                 ui.add_space(8.0);
                 ui.checkbox(&mut self.config.auto_start_replay, text("Включать откаты при запуске приложения", "Enable replay when the app starts", "Activar repetición al iniciar la aplicación"));
-                if cfg!(windows) {
+                if cfg!(windows) && crate::config::portable_dir().is_none() {
                     ui.checkbox(&mut self.config.auto_start_windows, text("Запускать opnoverlay при входе в Windows", "Start opnoverlay when signing in to Windows", "Iniciar opnoverlay al entrar en Windows"));
+                }
+                #[cfg(windows)]
+                {
+                    ui.add_space(10.0);
+                    ui.label(text("Тест записывает выбранный экран или окно без звука на 3 секунды. Тестовый файл удаляется автоматически.", "The test records the chosen display or window for 3 seconds without audio and automatically deletes the test file.", "La prueba graba la pantalla o ventana elegida durante 3 segundos sin audio y borra el archivo automáticamente."));
+                    setup_test_button(ui, &self.config, self.selected, language);
                 }
                 ui.add_space(10.0);
                 if ui.button(text("Сохранить и продолжить", "Save and continue", "Guardar y continuar")).clicked() { finish = true; }
@@ -3264,6 +3600,84 @@ impl App {
             self.update_dialog = false;
         }
     }
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+enum SetupTest {
+    Running,
+    Complete(Result<String, String>),
+}
+
+#[cfg(windows)]
+fn setup_test_button(ui: &mut egui::Ui, config: &Config, source: Option<SourceId>, language: Language) {
+    let text = |ru, en, es| match language { Language::Russian => ru, Language::English => en, Language::Spanish => es };
+    let id = egui::Id::unique("diagnostic-recording");
+    let state = ui.data(|data| data.get_temp::<SetupTest>(id));
+    let running = matches!(state, Some(SetupTest::Running));
+    if ui.add_enabled(source.is_some() && !running, Button::new(text("Проверить запись", "Test recording", "Probar grabación"))).clicked() && let Some(source) = source {
+        let ctx = ui.ctx().clone();
+        let config = config.clone();
+        ui.data_mut(|data| data.insert_temp(id, SetupTest::Running));
+        if let Err(error) = thread::Builder::new().name("recording-diagnostic".into()).spawn(move || {
+            let result = test_recording(&config, source);
+            ctx.data_mut(|data| data.insert_temp(id, SetupTest::Complete(result)));
+            ctx.request_repaint();
+        }) {
+            ui.data_mut(|data| data.insert_temp(id, SetupTest::Complete(Err(error.to_string()))));
+        }
+    }
+    match state {
+        Some(SetupTest::Running) => { ui.label(text("Идёт тест…", "Test in progress…", "Prueba en curso…")); }
+        Some(SetupTest::Complete(Ok(report))) => {
+            ui.colored_label(PRIMARY_LIGHT, text("Видео записано", "Video recorded", "Vídeo grabado"));
+            ui.label(&report);
+            if ui.button(text("Копировать результат", "Copy result", "Copiar resultado")).clicked() { ui.ctx().copy_text(report); }
+        }
+        Some(SetupTest::Complete(Err(error))) => {
+            ui.colored_label(RED, text("Тест записи завершился ошибкой", "Recording test failed", "La prueba de grabación falló"));
+            ui.label(error);
+        }
+        None => {}
+    }
+}
+
+#[cfg(windows)]
+fn test_recording(config: &Config, source: SourceId) -> Result<String, String> {
+    let directory = tempfile::Builder::new().prefix("opnoverlay-diagnostic-").tempdir().map_err(|error| error.to_string())?;
+    let out = directory.path().join("test.mp4");
+    let opts = SessionOptions {
+        source,
+        fps: config.fps,
+        cursor: config.cursor,
+        desktop_duplication: config.desktop_duplication,
+        preview_fps: 0,
+        record: Some(RecordConfig {
+            quality: config.quality,
+            custom_bitrate_mbps: config.custom_bitrate_mbps,
+            resolution: config.resolution,
+            display_canvas: (config.stretch_display && config.region.is_none()).then(|| capture::desktop_resolution(source)).flatten(),
+            audio: false,
+            separate_audio_tracks: false,
+            region: config.region,
+            overlay: None,
+        }),
+    };
+    let session = Session::start(opts, None)?;
+    session.shared.outputs.lock().unwrap().start_file(out.clone());
+    thread::sleep(Duration::from_secs(3));
+    let backend = session.backend_name();
+    let size = *session.shared.sizes.lock().unwrap();
+    let (encoder, failure) = session.stop();
+    if let Some(error) = failure { return Err(error); }
+    let encoder = encoder.ok_or_else(|| "No video frames captured".to_owned())?;
+    let (frames, lagged) = encoder.stats();
+    let name = encoder.name().to_owned();
+    encoder.finish().ok_or("No recording was created")?.finish()?;
+    let (_, (width, height)) = size.ok_or("Recording size is unavailable")?;
+    let bytes = out.metadata().map_err(|error| error.to_string())?.len();
+    directory.close().map_err(|error| error.to_string())?;
+    Ok(format!("opnoverlay {}\n{backend}\n{name}\n{width} × {height} | {frames} frames | {lagged} lagged | {bytes} bytes", env!("CARGO_PKG_VERSION")))
 }
 
 /// Opens a web page in the default browser.
@@ -3407,6 +3821,67 @@ fn storage_panel(ui: &mut egui::Ui, state: &mut StoragePanel, folder: &Path, fil
     }
 }
 
+fn profile_source(source: &Source) -> Option<ProfileSource> {
+    #[cfg(windows)]
+    if let Some(key) = capture::display_key(source.id) {
+        return Some(ProfileSource::Display(key));
+    }
+    matches!(source.id, SourceId::Window(_)).then(|| ProfileSource::Window(source.label.clone()))
+}
+
+fn recording_profiles(ui: &mut egui::Ui, config: &mut Config, duration: &mut String, selected: &mut Option<SourceId>, sources: &[Source], language: Language) {
+    let text = |ru, en, es| match language { Language::Russian => ru, Language::English => en, Language::Spanish => es };
+    group_title(ui, text("Профили игр", "Game profiles", "Perfiles de juegos"));
+    let state = ui.scope_id().with("recording-profile");
+    let (mut name, mut notice) = ui.data(|data| data.get_temp::<(String, &'static str)>(state)).unwrap_or_default();
+    let label = ui.label(text("Имя профиля", "Profile name", "Nombre del perfil"));
+    if ui.add(egui::TextEdit::singleline(&mut name).char_limit(48)).labelled_by(label.id).changed() { notice = ""; }
+    if !config.recording_profiles.is_empty() {
+        ComboBox::from_id_salt("saved-profiles").selected_text(text("Выбрать сохранённый профиль", "Choose a saved profile", "Elegir un perfil guardado"))
+            .show_ui(ui, |ui| {
+                for saved in config.recording_profiles.keys() {
+                    if ui.selectable_label(name.trim() == saved, saved).clicked() {
+                        name.clone_from(saved);
+                        notice = "";
+                    }
+                }
+            });
+    }
+    let key = name.trim().to_owned();
+    let exists = config.recording_profiles.contains_key(&key);
+    ui.horizontal_wrapped(|ui| {
+        let save = if exists { text("Обновить профиль", "Update profile", "Actualizar perfil") } else { text("Сохранить профиль", "Save profile", "Guardar perfil") };
+        let seconds = parse_replay_duration(duration);
+        if ui.add_enabled(!key.is_empty() && seconds.is_some(), Button::new(save)).clicked() && let Some(seconds) = seconds {
+            let source = sources.iter().find(|source| Some(source.id) == *selected).and_then(profile_source);
+            config.recording_profiles.insert(key.clone(), RecordingProfile::from_config(config, seconds, source));
+            notice = text("Нажмите «Сохранить», чтобы сохранить профиль.", "Press OK to save the profile.", "Pulsa Aceptar para guardar el perfil.");
+        }
+        if ui.add_enabled(exists, Button::new(text("Загрузить", "Load", "Cargar"))).clicked() && let Some(profile) = config.recording_profiles.get(&key).cloned() {
+            let target = profile.source.as_ref().and_then(|wanted| {
+                let mut matches = sources.iter().filter(|source| profile_source(source).as_ref() == Some(wanted));
+                let first = matches.next()?.id;
+                matches.next().is_none().then_some(first)
+            });
+            if profile.source.is_none() || target.is_some() {
+                profile.apply(config);
+                *selected = target.or(*selected);
+                let seconds = config.replay_seconds;
+                *duration = format!("{:02}:{:02}", seconds / 60, seconds % 60);
+                notice = text("Профиль загружен. Нажмите «Сохранить», чтобы применить.", "Profile loaded. Press OK to apply it.", "Perfil cargado. Pulsa Aceptar para aplicarlo.");
+            } else {
+                notice = text("Откройте игру и снова войдите в настройки. Сохранённый источник должен быть доступен.", "Open the game and reopen settings. The saved capture source must be available.", "Abre el juego y vuelve a ajustes. La fuente guardada debe estar disponible.");
+            }
+        }
+        if ui.add_enabled(exists, Button::new(text("Удалить профиль", "Delete profile", "Eliminar perfil"))).clicked() {
+            config.recording_profiles.remove(&key);
+            notice = text("Нажмите «Сохранить», чтобы удалить профиль.", "Press OK to delete the profile.", "Pulsa Aceptar para eliminar el perfil.");
+        }
+    });
+    if !notice.is_empty() { ui.label(RichText::new(notice).small().color(TEXT_MUTED)); }
+    ui.data_mut(|data| data.insert_temp(state, (name, notice)));
+}
+
 fn compact_settings_page(ui: &mut egui::Ui, dialog: &mut SettingsDialog, system: &[Device], mic: &[Device], sources: &[Source], source_size: Option<(u32, u32)>) {
     let SettingsDialog { draft: c, page, capturing, replay_duration, selected_source } = dialog;
     let width = ui.available_width().min(330.0);
@@ -3421,14 +3896,20 @@ fn compact_settings_page(ui: &mut egui::Ui, dialog: &mut SettingsDialog, system:
             ui.checkbox(&mut c.minimize_to_tray, text("Сворачивать в системный трей", "Minimize to system tray", "Minimizar a la bandeja"));
             ui.checkbox(&mut c.notifications, text("Показывать уведомления", "Show notifications", "Mostrar notificaciones"));
             if cfg!(windows) {
-                ui.checkbox(&mut c.auto_start_windows, text("Запускать вместе с Windows", "Start with Windows", "Iniciar con Windows"));
+                if crate::config::portable_dir().is_none() {
+                    ui.checkbox(&mut c.auto_start_windows, text("Запускать вместе с Windows", "Start with Windows", "Iniciar con Windows"));
+                }
                 ui.checkbox(&mut c.hide_from_capture, text("Скрывать оверлей в записи", "Hide overlay in recordings", "Ocultar el panel en la grabación"));
                 ui.checkbox(&mut c.hide_notifications_from_capture, text("Скрывать уведомления в записи", "Hide notifications in recordings", "Ocultar notificaciones en la grabación"));
             }
             ui.add_space(8.0);
             group_title(ui, text("Показатели", "Metrics", "Métricas"));
             ui.horizontal_wrapped(|ui| {
-                if cfg!(windows) { ui.checkbox(&mut c.hud_fps, "FPS"); }
+                if cfg!(windows) {
+                    ui.checkbox(&mut c.hud_fps, "FPS");
+                    ui.checkbox(&mut c.hud_frame_time, text("Время кадра", "Frame time", "Tiempo de fotograma"))
+                        .on_hover_text(text("Среднее время показа кадра. Источник — выбранное окно или активное приложение при захвате экрана.", "Average displayed frame time for the selected window or the foreground app when capturing a display.", "Tiempo medio de fotograma de la ventana elegida o de la aplicación activa al capturar la pantalla."));
+                }
                 ui.checkbox(&mut c.hud_cpu, "CPU");
                 ui.checkbox(&mut c.hud_memory, text("ОЗУ", "RAM", "RAM"));
                 if cfg!(windows) {
@@ -3437,6 +3918,12 @@ fn compact_settings_page(ui: &mut egui::Ui, dialog: &mut SettingsDialog, system:
                     ui.checkbox(&mut c.hud_video_memory, text("Видеопамять", "Video memory", "Memoria de vídeo"));
                 }
             });
+            let size_label = ui.label(text("Размер показателей", "Metrics size", "Tamaño de métricas"));
+            combo(ui, "hud-size", &mut c.hud_size, &HudSize::ALL, |size| match size {
+                HudSize::Compact => text("Компактный", "Compact", "Compacto"),
+                HudSize::Normal => text("Обычный", "Normal", "Normal"),
+                HudSize::Large => text("Крупный", "Large", "Grande"),
+            }.to_owned(), width).labelled_by(size_label.id);
             let corner_label = ui.label(text("Положение показателей", "Metrics position", "Posición de métricas"));
             combo(ui, "hud-corner", &mut c.hud_corner, &HudCorner::ALL, |corner| match corner {
                 HudCorner::TopLeft => text("Сверху слева", "Top left", "Arriba a la izquierda"),
@@ -3446,6 +3933,44 @@ fn compact_settings_page(ui: &mut egui::Ui, dialog: &mut SettingsDialog, system:
             }.to_owned(), width).labelled_by(corner_label.id);
         }
         SettingsPage::Output => {
+            recording_profiles(ui, c, replay_duration, selected_source, sources, language);
+            ui.add_space(10.0);
+            group_title(ui, text("Качество записи", "Recording quality", "Calidad de grabación"));
+            if ui.button(text("Экономный профиль · до 720p и 30 FPS", "Light profile · up to 720p and 30 FPS", "Perfil ligero · hasta 720p y 30 FPS")).clicked() {
+                c.apply_light_profile();
+            }
+            let quality_label = ui.label(text("Качество видео", "Video quality", "Calidad de vídeo"));
+            combo(ui, "quality", &mut c.quality, &Quality::ALL, |quality| match quality {
+                Quality::Low => text("Экономия места", "Save space", "Ahorrar espacio"),
+                Quality::Medium => text("Баланс", "Balanced", "Equilibrado"),
+                Quality::High => text("Максимум деталей", "Maximum detail", "Máximo detalle"),
+                Quality::Custom => text("Свои настройки", "Custom", "Personalizado"),
+            }.into(), width).labelled_by(quality_label.id);
+            if c.quality == Quality::Custom { ui.add(egui::Slider::new(&mut c.custom_bitrate_mbps, 1..=80).suffix(text(" Мбит/с", " Mbps", " Mbps"))).accessible_name(text("Битрейт видео", "Video bitrate", "Tasa de bits de vídeo")); }
+            let resolution_label = ui.label(text("Разрешение", "Resolution", "Resolución"));
+            combo(ui, "res", &mut c.resolution, &Resolution::ALL, |resolution| resolution.label().into(), width).labelled_by(resolution_label.id);
+            let fps_label = ui.label(text("Частота кадров", "Frame rate", "Frecuencia de fotogramas"));
+            ui.add(egui::DragValue::new(&mut c.fps).range(1..=240).suffix(" FPS")).labelled_by(fps_label.id);
+            if c.fps > 60 { ui.label(text("Высокая частота увеличивает нагрузку и размер записи.", "Higher frame rates increase load and file size.", "Una frecuencia alta aumenta la carga y el tamaño del archivo.")); }
+            let video_bitrate = source_size.map(|source| {
+                let input = c.region.and_then(|region| region.fit(source)).map_or(source, |region| (region.width, region.height));
+                let (width, height) = c.resolution.apply(input);
+                c.quality.selected_bitrate(c.custom_bitrate_mbps, width, height, c.fps)
+            });
+            let mb_per_second = video_bitrate.map(|bitrate| (f64::from(bitrate) + 192_000.0) / 8_000_000.0);
+            if let (Some(bitrate), Some(mb_per_second)) = (video_bitrate, mb_per_second) {
+                let mbps = f64::from(bitrate) / 1_000_000.0;
+                let per_minute = mb_per_second * 60.0;
+                ui.add(egui::Label::new(match language {
+                    Language::Russian => format!("Битрейт {mbps:.1} Мбит/с · ≈ {per_minute:.0} МБ за минуту"),
+                    Language::English => format!("Bitrate {mbps:.1} Mbps · ≈ {per_minute:.0} MB per minute"),
+                    Language::Spanish => format!("Tasa de bits {mbps:.1} Mbps · ≈ {per_minute:.0} MB por minuto"),
+                }).wrap());
+                ui.label(RichText::new(text("Оценка включает звук. Фактический размер зависит от записи.", "Estimate includes audio. Actual size depends on the recording.", "La estimación incluye audio. El tamaño real depende de la grabación.")).small().color(TEXT_MUTED));
+            } else {
+                ui.label(RichText::new(text("Оценка появится, когда станет доступно разрешение выбранного источника.", "The estimate appears when the selected source resolution is available.", "La estimación aparece cuando se conoce la resolución de la fuente elegida.")).small().color(TEXT_MUTED));
+            }
+            ui.add_space(10.0);
             group_title(ui, text("Откат", "Replay", "Repetición"));
             let duration_label = ui.label(text("Длительность отката · минуты:секунды", "Replay duration · minutes:seconds", "Duración · minutos:segundos"));
             ui.add(egui::TextEdit::singleline(replay_duration).desired_width(100.0).char_limit(8)).labelled_by(duration_label.id);
@@ -3460,18 +3985,23 @@ fn compact_settings_page(ui: &mut egui::Ui, dialog: &mut SettingsDialog, system:
                 ui.selectable_value(&mut c.replay_storage, ReplayStorage::Memory, text("Оперативная память", "Memory", "Memoria RAM"));
                 ui.selectable_value(&mut c.replay_storage, ReplayStorage::Disk, text("Временные файлы на диске", "Temporary disk files", "Archivos temporales en disco"));
             }).response.labelled_by(storage_label.id);
-            if let (Some(source), Some(seconds)) = (source_size, parse_replay_duration(replay_duration)) {
-                let input = c.region.and_then(|region| region.fit(source)).map_or(source, |region| (region.width, region.height));
-                let (w, h) = c.resolution.apply(input);
-                let estimate = (u64::from(c.quality.selected_bitrate(c.custom_bitrate_mbps, w, h, c.fps)) + 192_000) * u64::from(seconds) / 8_000_000;
+            if c.replay_storage == ReplayStorage::Disk {
+                let limit_label = ui.label(text("Лимит временного буфера", "Temporary buffer limit", "Límite del búfer temporal"));
+                ui.add(egui::DragValue::new(&mut c.replay_disk_limit_mib)
+                    .range(Config::REPLAY_DISK_LIMIT_MIB).speed(16.0)
+                    .suffix(text(" МиБ", " MiB", " MiB"))).labelled_by(limit_label.id);
+                ui.label(RichText::new(text("При нехватке места сохраняется более короткий откат.", "The replay can be shorter when the buffer reaches this limit.", "La repetición puede ser más corta cuando el búfer alcanza el límite.")).small().color(TEXT_MUTED));
+            }
+            if let (Some(mb_per_second), Some(seconds)) = (mb_per_second, parse_replay_duration(replay_duration)) {
+                let estimate = mb_per_second * f64::from(seconds);
                 ui.add(egui::Label::new(match language {
-                    Language::Russian => format!("Примерно {estimate} МБ; фактический размер зависит от записи."),
-                    Language::English => format!("About {estimate} MB; actual size depends on the recording."),
-                    Language::Spanish => format!("Unos {estimate} MB; el tamaño real depende de la grabación."),
+                    Language::Russian => format!("Оценка размера буфера · ≈ {estimate:.0} МБ"),
+                    Language::English => format!("Estimated buffer size · ≈ {estimate:.0} MB"),
+                    Language::Spanish => format!("Tamaño estimado del búfer · ≈ {estimate:.0} MB"),
                 }).wrap());
             }
             ui.add_space(10.0);
-            group_title(ui, text("Файлы и качество", "Files and quality", "Archivos y calidad"));
+            group_title(ui, text("Файлы", "Files", "Archivos"));
             {
                 let label = text("Общая папка файлов", "Media folder", "Carpeta de archivos");
                 let folder = &mut c.output_dir;
@@ -3488,27 +4018,6 @@ fn compact_settings_page(ui: &mut egui::Ui, dialog: &mut SettingsDialog, system:
             let video_name_label = ui.label(text("Имя обычной записи", "Recording name", "Nombre de la grabación"));
             ui.add(egui::TextEdit::singleline(&mut c.video_name_template).desired_width(width)).labelled_by(video_name_label.id);
             ui.label(RichText::new("[ГГГГ-ММ-ДД]  [ЧЧ-ММ]  [ЧЧ-ММ-СС]").small().color(TEXT_MUTED));
-            let quality_label = ui.label(text("Качество видео", "Video quality", "Calidad de vídeo"));
-            combo(ui, "quality", &mut c.quality, &Quality::ALL, |quality| match quality {
-                Quality::Low => text("Экономия места", "Save space", "Ahorrar espacio"),
-                Quality::Medium => text("Баланс", "Balanced", "Equilibrado"),
-                Quality::High => text("Максимум деталей", "Maximum detail", "Máximo detalle"),
-                Quality::Custom => text("Свои настройки", "Custom", "Personalizado"),
-            }.into(), width).labelled_by(quality_label.id);
-            if c.quality == Quality::Custom { ui.add(egui::Slider::new(&mut c.custom_bitrate_mbps, 1..=80).suffix(text(" Мбит/с", " Mbps", " Mbps"))).accessible_name(text("Битрейт видео", "Video bitrate", "Tasa de bits de vídeo")); }
-            if let Some(source) = source_size {
-                let input = c.region.and_then(|region| region.fit(source)).map_or(source, |region| (region.width, region.height));
-                let (w, h) = c.resolution.apply(input);
-                let per_minute = (c.quality.selected_bitrate(c.custom_bitrate_mbps, w, h, c.fps) as f64 + 192_000.0) * 60.0 / 8_000_000.0;
-                ui.label(match language {
-                    Language::Russian => format!("Оценка размера: ≈ {per_minute:.0} МБ/мин · {:.1} ГБ/час", per_minute * 60.0 / 1000.0),
-                    Language::English => format!("Estimated size: ≈ {per_minute:.0} MB/min · {:.1} GB/hour", per_minute * 60.0 / 1000.0),
-                    Language::Spanish => format!("Tamaño estimado: ≈ {per_minute:.0} MB/min · {:.1} GB/hora", per_minute * 60.0 / 1000.0),
-                });
-                ui.add(egui::Label::new(RichText::new(text("Приблизительно для текущего качества, разрешения и FPS. Фактический размер может отличаться.", "Approximate for the current quality, resolution and FPS. Actual size may vary.", "Estimación según calidad, resolución y FPS. El tamaño real puede variar.")).small().color(TEXT_MUTED)).wrap());
-            } else {
-                ui.add(egui::Label::new(RichText::new(text("Оценка размера появится, когда разрешение источника будет доступно.", "The size estimate appears when the source resolution is available.", "La estimación aparece cuando se conoce la resolución de la fuente.")).small().color(TEXT_MUTED)).wrap());
-            }
             let screenshot_label = ui.label(text("Формат скриншота", "Screenshot format", "Formato de captura"));
             combo(ui, "screenshot-format", &mut c.screenshot_format, &ScreenshotFormat::ALL, |format| format.label().into(), width).labelled_by(screenshot_label.id);
             if c.screenshot_format == ScreenshotFormat::Jpeg { ui.add(egui::Slider::new(&mut c.jpeg_quality, 1..=100).text(text("Качество JPEG", "JPEG quality", "Calidad JPEG"))); }
@@ -3522,6 +4031,17 @@ fn compact_settings_page(ui: &mut egui::Ui, dialog: &mut SettingsDialog, system:
             let mic_label = ui.label(text("Микрофон", "Microphone", "Micrófono"));
             device_combo(ui, "micdev", &mut c.mic, &mut c.mic_device, mic).labelled_by(mic_label.id);
             ui.checkbox(&mut c.mic_denoise, text("Подавление шума микрофона", "Microphone noise suppression", "Reducción de ruido del micrófono"));
+            #[cfg(windows)]
+            {
+                ui.checkbox(&mut c.separate_audio_tracks, text("Сохранять отдельные дорожки", "Keep separate audio tracks", "Guardar pistas de audio separadas"));
+                if c.separate_audio_tracks {
+                    ui.label(RichText::new(text(
+                        "MP4 содержит общий звук для просмотра, а также отдельные дорожки игры и микрофона для монтажа.",
+                        "The MP4 includes a playback mix and separate game and microphone tracks for editing.",
+                        "El MP4 incluye una mezcla para reproducir y pistas separadas de juego y micrófono para editar."
+                    )).small().color(TEXT_MUTED));
+                }
+            }
         }
         SettingsPage::Video => {
             group_title(ui, text("Видео", "Video", "Vídeo"));
@@ -3539,11 +4059,21 @@ fn compact_settings_page(ui: &mut egui::Ui, dialog: &mut SettingsDialog, system:
                 }
             }).response.labelled_by(source_label.id);
             ui.label(text("Выберите экран, чтобы записывать переключение между игрой и рабочим столом.", "Choose a screen to record switching between the game and desktop.", "Elige una pantalla para grabar el cambio entre el juego y el escritorio."));
-            let resolution_label = ui.label(text("Разрешение", "Resolution", "Resolución"));
-            combo(ui, "res", &mut c.resolution, &Resolution::ALL, |resolution| resolution.label().into(), width).labelled_by(resolution_label.id);
-            let fps_label = ui.label(text("Частота кадров", "Frame rate", "Frecuencia de fotogramas"));
-            ui.add(egui::DragValue::new(&mut c.fps).range(1..=240).suffix(" FPS")).labelled_by(fps_label.id);
-            if c.fps > 60 { ui.label(text("Высокая частота увеличивает нагрузку и размер записи.", "Higher frame rates increase load and file size.", "Una frecuencia alta aumenta la carga y el tamaño del archivo.")); }
+            #[cfg(windows)]
+            ui.checkbox(&mut c.stretch_display, text("Сохранять растяжение экрана", "Preserve display stretching", "Conservar el estiramiento de pantalla"))
+                .on_hover_text(text("Если игра временно меняет разрешение экрана, изображение заполнит кадр с пропорциями рабочего стола.", "When a game temporarily changes the display resolution, the image fills a frame with the desktop aspect ratio.", "Si un juego cambia la resolución de pantalla temporalmente, la imagen llena un cuadro con la proporción del escritorio."));
+            #[cfg(windows)]
+            {
+                ui.checkbox(&mut c.cursor, text("Захватывать указатель мыши", "Capture mouse pointer", "Capturar puntero del ratón"));
+                ui.checkbox(&mut c.desktop_duplication, text("Захват экрана через DXGI", "Capture display using DXGI", "Capturar pantalla con DXGI"));
+                if c.desktop_duplication {
+                    ui.label(RichText::new(text(
+                        "DXGI используется для захвата монитора в режиме рабочего стола при отключённом указателе. Для окон и временных режимов экрана используется стандартный способ Windows.",
+                        "DXGI captures a monitor in its desktop mode with the pointer disabled. Window capture and temporary display modes use the standard Windows method.",
+                        "DXGI captura el monitor en su modo de escritorio con el puntero desactivado. Las ventanas y los modos temporales usan el método estándar de Windows."
+                    )).small().color(TEXT_MUTED));
+                }
+            }
         }
         SettingsPage::Hotkeys => {
             group_title(ui, text("Горячие клавиши", "Hotkeys", "Atajos de teclado"));
@@ -3564,6 +4094,15 @@ fn compact_settings_page(ui: &mut egui::Ui, dialog: &mut SettingsDialog, system:
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
+        #[cfg(windows)]
+        if !self.preview_visible() {
+            if self.preview.take().is_some() {
+                self.texture = None;
+                self.texture_seq = None;
+            }
+        } else if self.preview.is_none() && self.selected.is_some() && !self.is_session_active() {
+            self.restart_preview(ctx);
+        }
         if self.notification.is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
         }
@@ -3581,8 +4120,17 @@ impl eframe::App for App {
         if self.config.hud_enabled && self.config.setup_complete {
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
         }
-        let (monitor, current) = ctx.input(|i| (i.viewport().monitor_size, i.viewport().inner_rect.map(|rect| rect.size())));
-        if let Some(monitor) = monitor {
+        let (monitor, current, outer) = ctx.input(|i| (i.viewport().monitor_size, i.viewport().inner_rect.map(|rect| rect.size()), i.viewport().outer_rect));
+        #[cfg(windows)]
+        let monitor = if !self.hidden {
+            let mut bounds = self.overlay_display.and_then(crate::platform::sys::display_bounds);
+            if bounds.is_none() {
+                self.overlay_display = crate::platform::sys::active_display();
+                bounds = self.overlay_display.and_then(crate::platform::sys::display_bounds);
+            }
+            bounds.map(|r| vec2((r.right - r.left) as f32, (r.bottom - r.top) as f32) / ctx.pixels_per_point()).or(monitor)
+        } else { monitor };
+        if let Some(monitor) = monitor.filter(|_| !self.hidden) {
             #[cfg(windows)]
             let width: f32 = if self.player.is_some() { 1100.0 } else if self.advanced_view { 740.0 } else { 420.0 };
             #[cfg(not(windows))]
@@ -3604,18 +4152,25 @@ impl eframe::App for App {
                 let width = width.min(monitor.x);
                 vec2(width, (width * 9.0 / 16.0 + DOCK_HEIGHT + 100.0).min(monitor.y))
             } else { vec2(width.min(monitor.x), monitor.y) };
-            if current.is_some_and(|size| (size.x - desired.x).abs() > 2.0 || (size.y - desired.y).abs() > 2.0) {
+            let resized = current.is_some_and(|size| (size.x - desired.x).abs() > 2.0 || (size.y - desired.y).abs() > 2.0);
+            if resized {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+            }
+            #[cfg(windows)]
+            let media_open = self.player.is_some() || self.image_viewer.is_some();
+            #[cfg(not(windows))]
+            let media_open = self.image_viewer.is_some();
+            if media_open && self.closing.is_none() { self.opening = None; }
+            if self.opening.is_none() && self.closing.is_none() {
+                let position = if media_open { pos2((monitor.x - desired.x) / 2.0, (monitor.y - desired.y) / 2.0) } else { pos2(0.0, 0.0) };
                 #[cfg(windows)]
-                let position = if self.player.is_some() || self.image_viewer.is_some() { pos2((monitor.x - desired.x) / 2.0, (monitor.y - desired.y) / 2.0) } else { pos2(0.0, 0.0) };
+                let expected = {
+                    let (x, y, _) = self.overlay_position_pixels(ctx, position);
+                    pos2(x as f32, y as f32) / ctx.pixels_per_point()
+                };
                 #[cfg(not(windows))]
-                let position = if self.image_viewer.is_some() { pos2((monitor.x - desired.x) / 2.0, (monitor.y - desired.y) / 2.0) } else { pos2(0.0, 0.0) };
-                #[cfg(windows)]
-                let media_open = self.player.is_some() || self.image_viewer.is_some();
-                #[cfg(not(windows))]
-                let media_open = self.image_viewer.is_some();
-                if media_open && self.closing.is_none() { self.opening = None; }
-                if self.opening.is_none() && self.closing.is_none() { ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position)); }
+                let expected = position;
+                if resized || outer.is_some_and(|rect| rect.min.distance(expected) > 2.0) { self.move_overlay(ctx, position); }
             }
         }
         if ctx.input(|i| i.viewport().close_requested()) && !self.exit_requested && self.tray.is_some() {
@@ -3624,6 +4179,8 @@ impl eframe::App for App {
         }
         let hidden = preview_hidden(ctx.input(|i| i.viewport().visible()), self.last_drawn.elapsed());
         if let Some(session) = self.active_session().or(self.preview.as_ref()) {
+            #[cfg(windows)]
+            let hidden = hidden || !self.preview_visible();
             session.shared.preview_hidden.store(hidden, Ordering::Relaxed);
         }
         // The meters fall only while drawn: hidden, they would keep the window waking 15 times a
@@ -3704,6 +4261,10 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        #[cfg(windows)]
+        if let Ok(mut meter) = self.hud_meter.lock() {
+            meter.fps_monitor = None;
+        }
         if let Some(path) = finish_on_exit(std::mem::replace(&mut self.rec, RecState::Idle)) {
             self.config.finish_recording(&path);
             add_gallery_file(&mut self.config.gallery_files, &path);
@@ -3793,6 +4354,16 @@ fn video_name(template: &str, time: chrono::NaiveDateTime) -> Result<String, Str
     Ok(name)
 }
 
+const GALLERY_PAGE_SIZE: usize = 21;
+
+fn gallery_matches(files: &[PathBuf], query: &str, limit: usize) -> Vec<PathBuf> {
+    files.iter().rev().filter(|path| {
+        let matches = query.is_empty() || path.file_name()
+            .is_some_and(|name| name.to_string_lossy().to_lowercase().contains(query));
+        matches && path.is_file()
+    }).take(limit).cloned().collect()
+}
+
 fn add_gallery_file(files: &mut Vec<PathBuf>, path: &Path) -> bool {
     if !path.is_file() || files.iter().any(|item| item == path) {
         return false;
@@ -3824,6 +4395,26 @@ fn recording_saved(path: PathBuf) -> Status {
     Status { recording: true, ..saved(text, path) }
 }
 
+fn finalize_recording(file: PendingFile, interruption: Option<String>) -> Status {
+    let path = file.path().to_owned();
+    let cause = file.finish().err().or(interruption);
+    recording_final_status(path, cause)
+}
+
+fn recording_final_status(path: PathBuf, cause: Option<String>) -> Status {
+    match (ensure_recording_finalized(path), cause) {
+        (Ok(path), None) => recording_saved(path),
+        (Ok(path), Some(cause)) => Status {
+            text: tr3!("Grabación parcial guardada: {}", "Partial recording saved: {}", "Записанная часть сохранена: {}", cause),
+            file: Some(path),
+            error: true,
+            recording: true,
+        },
+        (Err(error), Some(cause)) => failed(format!("{cause} · {error}")),
+        (Err(error), None) => failed(error),
+    }
+}
+
 /// Never leaves the MP4 half-written when the app closes mid-recording or mid-save.
 fn finish_on_exit(rec: RecState) -> Option<PathBuf> {
     match rec {
@@ -3832,12 +4423,12 @@ fn finish_on_exit(rec: RecState) -> Option<PathBuf> {
             if let (Some(enc), _) = session.stop()
                 && let Some(file) = enc.finish()
             {
-                return file.finish().and_then(ensure_recording_finalized).ok();
+                return finalize_recording(file, None).file;
             }
             None
         }
         RecState::Saving(rx) => {
-            rx.recv().ok().and_then(Result::ok)
+            rx.recv().ok().and_then(|status| status.file)
         }
         RecState::Idle => None,
     }
@@ -3866,11 +4457,11 @@ fn cpu_load(previous: (u64, u64), current: (u64, u64)) -> Option<f64> {
     Some((total - idle) as f64 * 100.0 / total as f64)
 }
 
-fn hud_position(corner: HudCorner, monitor: Vec2, height: f32) -> egui::Pos2 {
-    let left = 20.0f32.min((monitor.x - 190.0).max(0.0));
-    let right = (monitor.x - 210.0).max(0.0);
-    let top = 20.0f32.min((monitor.y - height).max(0.0));
-    let bottom = (monitor.y - height - 20.0).max(0.0);
+fn hud_position(corner: HudCorner, monitor: Vec2, size: Vec2) -> egui::Pos2 {
+    let left = 20.0f32.min((monitor.x - size.x).max(0.0));
+    let right = (monitor.x - size.x - 20.0).max(0.0);
+    let top = 20.0f32.min((monitor.y - size.y).max(0.0));
+    let bottom = (monitor.y - size.y - 20.0).max(0.0);
     match corner {
         HudCorner::TopLeft => pos2(left, top),
         HudCorner::TopRight => pos2(right, top),
@@ -3915,13 +4506,14 @@ impl SystemMeter {
     }
 
     #[cfg(windows)]
-    fn update_fps(&mut self, enabled: bool) {
-        if !enabled {
+    fn update_fps(&mut self, enabled: bool, target: Option<u32>) {
+        if !enabled || self.fps_target != target {
             self.fps_monitor = None;
             self.fps = None;
-            return;
         }
-        let monitor = self.fps_monitor.get_or_insert_with(crate::platform::fps::FpsMonitor::start);
+        self.fps_target = target;
+        if !enabled { return; }
+        let monitor = self.fps_monitor.get_or_insert_with(|| crate::platform::fps::FpsMonitor::start(target));
         if let Some(sample) = monitor.latest() { self.fps = Some(sample); }
     }
 }
@@ -4093,6 +4685,36 @@ fn list_row(ui: &mut egui::Ui, text: &str) -> egui::Response {
     response.on_hover_text(text)
 }
 
+#[cfg(windows)]
+fn selected_audio_picker(
+    ui: &mut egui::Ui, label: &str, choices: &AudioChoices, loading: bool, image: Option<&Path>,
+) -> (bool, Option<Arc<SelectedProcess>>) {
+    let menu = ui.menu_button(label, |ui| {
+        if loading {
+            ui.spinner();
+            return None;
+        }
+        egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+            let mut any = false;
+            for (title, process) in choices {
+                if image.is_some_and(|path| !selected::same_image(path, &process.path)) { continue; }
+                any = true;
+                if ui.button(format!("{title} · PID {}", process.id.pid))
+                    .on_hover_text(process.path.display().to_string()).clicked()
+                {
+                    ui.close();
+                    return Some(process.clone());
+                }
+            }
+            if !any {
+                ui.label(tr3!("No hay procesos disponibles", "No processes available", "Нет доступных процессов"));
+            }
+            None
+        }).inner
+    });
+    (menu.response.clicked(), menu.inner.flatten())
+}
+
 fn group_title(ui: &mut egui::Ui, title: &str) {
     ui.label(RichText::new(title).strong().size(14.0));
     ui.add_space(4.0);
@@ -4223,7 +4845,10 @@ fn device_combo(ui: &mut egui::Ui, id: &str, enabled: &mut bool, device: &mut Op
         device
             .as_ref()
             .and_then(|id| devices.iter().find(|d| &d.id == id))
-            .map_or(default.to_owned(), |d| d.name.clone())
+            .map_or_else(|| {
+                if device.is_some() { tr3!("No disponible", "Unavailable", "Недоступно").to_owned() }
+                else { default.to_owned() }
+            }, |d| d.name.clone())
     };
     let width = ui.available_width().min(330.0);
     ComboBox::from_id_salt(id).width(width).truncate().selected_text(current).show_ui(ui, |ui| {
@@ -4790,11 +5415,13 @@ mod tests {
         let mut pending: Vec<_> = pass(&mut app, size, vec![]).into_iter().map(|shape| shape.shape).collect();
         let mut seek_track = None;
         let mut volume_track = None;
+        let mut rewind = None;
         while let Some(shape) = pending.pop() {
             match shape {
                 egui::Shape::Vec(inner) => pending.extend(inner),
                 egui::Shape::Rect(rect) if rect.rect.width() > 800.0 && rect.rect.height() < 20.0 => seek_track = Some(rect.rect),
                 egui::Shape::Rect(rect) if (150.0..=220.0).contains(&rect.rect.width()) && rect.rect.height() < 20.0 => volume_track = Some(rect.rect),
+                egui::Shape::Text(text) if text.galley.text() == "−5 с" => rewind = Some(text.visual_bounding_rect().center()),
                 _ => {}
             }
         }
@@ -4807,6 +5434,17 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(app.player.as_ref().unwrap().1.position().unwrap_or(0.0) >= 10.0, "seek did not move the real player");
+        let before = app.player.as_ref().unwrap().1.position().unwrap();
+        let rewind = rewind.expect("rewind button missing");
+        let _ = pass(&mut app, size, vec![egui::Event::PointerMoved(rewind), egui::Event::PointerButton { pos: rewind, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }]);
+        let _ = pass(&mut app, size, vec![egui::Event::PointerButton { pos: rewind, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && app.player.as_ref().unwrap().1.position().unwrap_or(before) > before - 4.0 {
+            unsafe { while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() { let _ = TranslateMessage(&message); DispatchMessageW(&message); } }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let after = app.player.as_ref().unwrap().1.position().unwrap();
+        assert!((4.0..=6.0).contains(&(before - after)), "rewind moved the player from {before:.3} to {after:.3}");
         let volume = volume_track.expect("volume slider missing").center();
         let _ = pass(&mut app, size, vec![egui::Event::PointerMoved(volume), egui::Event::PointerButton { pos: volume, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }]);
         let _ = pass(&mut app, size, vec![egui::Event::PointerButton { pos: volume, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]);
@@ -4836,15 +5474,24 @@ mod tests {
         assert_eq!(app.trim_frames.len(), 10, "timeline frames did not load");
         let mut shapes: Vec<_> = pass(&mut app, editor_size, vec![]).into_iter().map(|shape| shape.shape).collect();
         let mut handles = Vec::new();
+        let mut nudge_start = None;
         while let Some(shape) = shapes.pop() {
             match shape {
                 egui::Shape::Vec(inner) => shapes.extend(inner),
                 egui::Shape::Rect(rect) if rect.fill == PRIMARY_LIGHT && (rect.rect.width() - 20.0).abs() < 0.1 && (rect.rect.height() - 58.0).abs() < 0.1 => handles.push(rect.rect),
+                egui::Shape::Text(text) if text.galley.text() == "+10 мс" => {
+                    let center = text.visual_bounding_rect().center();
+                    if nudge_start.is_none_or(|current: egui::Pos2| center.y < current.y) { nudge_start = Some(center); }
+                }
                 _ => {}
             }
         }
         handles.sort_by(|a, b| a.left().total_cmp(&b.left()));
         assert_eq!(handles.len(), 2, "timeline handles missing");
+        let nudge_start = nudge_start.expect("trim adjustment button missing");
+        let _ = pass(&mut app, editor_size, vec![egui::Event::PointerMoved(nudge_start), egui::Event::PointerButton { pos: nudge_start, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }]);
+        let _ = pass(&mut app, editor_size, vec![egui::Event::PointerButton { pos: nudge_start, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]);
+        assert_eq!(app.pending_trim.as_ref().and_then(|(_, start, _)| parse_trim_time(start)), Some(10));
         let start_handle = handles[0].center();
         let moved = start_handle + vec2(150.0, 0.0);
         let _ = pass(&mut app, editor_size, vec![egui::Event::PointerMoved(start_handle), egui::Event::PointerButton { pos: start_handle, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }]);
@@ -4865,6 +5512,51 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn refreshing_devices_keeps_unavailable_explicit_endpoints() {
+        let mut app = test_app();
+        app.config.system_device = Some("missing output fixture".into());
+        app.config.mic_device = Some("missing microphone fixture".into());
+        app.refresh_devices();
+        assert_eq!(app.config.system_device.as_deref(), Some("missing output fixture"));
+        assert_eq!(app.config.mic_device.as_deref(), Some("missing microphone fixture"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn recovery_does_not_switch_from_a_missing_window_to_the_desktop() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.refresh_sources();
+        assert!(matches!(app.selected, Some(SourceId::Monitor(_)) | None));
+        app.desktop_resume = Some(CaptureResume {
+            source: Some(CaptureSource::Window { handle: 0, process: Some(1) }),
+            recording: true,
+            replay: true,
+            paused: false,
+            not_before: None,
+        });
+        app.resume_pending_capture(&ctx);
+        assert!(app.selected.is_none());
+        assert!(!app.is_recording() && !app.is_replaying());
+        assert!(app.status.as_ref().is_some_and(|status| status.error));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn disconnected_selected_display_does_not_switch_to_an_unselected_source() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.config.source_display = Some("unavailable monitor in test".into());
+        app.selected = Some(SourceId::Monitor(0));
+        app.check_selected_display(&ctx);
+        assert!(app.selected.is_none());
+        assert_eq!(app.config.source_display.as_deref(), Some("unavailable monitor in test"));
+        assert!(app.status.as_ref().is_some_and(|status| status.error));
+        assert!(app.active_session().is_none());
+    }
 
     #[test]
     fn application_audio_failure_is_reported_once_per_error() {
@@ -5071,6 +5763,8 @@ mod tests {
             opening: None,
             closing: None,
             #[cfg(windows)]
+            overlay_display: None,
+            #[cfg(windows)]
             focus_armed: false,
             exit_requested: false,
             advanced_view: false,
@@ -5095,11 +5789,14 @@ mod tests {
             #[cfg(windows)]
             trim_error: None,
             gallery_deletions: Vec::new(),
+            gallery_query: String::new(),
+            gallery_limit: GALLERY_PAGE_SIZE,
             gallery_thumbnails: HashMap::new(),
             gallery_loading: HashMap::new(),
             disk_check: None,
             last_disk_check: None,
             low_disk_warned: false,
+            disk_replay_budget: Arc::default(),
             #[cfg(windows)]
             desktop_available: crate::platform::sys::interactive_desktop_available(),
             #[cfg(windows)]
@@ -5484,7 +6181,9 @@ mod tests {
         drop(tx);
         app.poll(&ctx);
         assert!(matches!(app.rec, RecState::Idle));
-        assert!(app.status.as_ref().is_some_and(|status| status.error && status.text.contains("обработчик сохранения")));
+        assert!(app.status.as_ref().is_some_and(|status| status.error && matches!(status.text.as_str(),
+            "Обработчик сохранения завершился." | "The recording saver stopped." | "El proceso de guardado se cerró."
+        )));
     }
 
     #[cfg(windows)]
@@ -5972,17 +6671,40 @@ mod tests {
         let key = |pressed| egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE };
         pass(&mut app, vec![]);
         let mut visited = Vec::new();
-        for _ in 0..11 {
+        for _ in 0..12 {
             pass(&mut app, vec![key(true)]);
             pass(&mut app, vec![key(false)]);
             if let Some(rect) = ctx.memory(|memory| memory.focused()).and_then(|id| ctx.read_response(id)).map(|response| response.rect) {
                 visited.push(rect.center());
             }
         }
-        assert_eq!(visited.len(), 11, "not all controls received focus: {visited:?}");
+        assert_eq!(visited.len(), 12, "not all controls received focus: {visited:?}");
         assert!(visited[..2].iter().all(|position| position.y < size.y * 0.1), "header focus order: {visited:?}");
         assert!(visited[2..9].iter().all(|position| position.y > size.y * 0.1 && position.y < size.y * 0.7), "primary focus order: {visited:?}");
-        assert!(visited[9..].iter().all(|position| position.y > size.y * 0.8), "footer focus order: {visited:?}");
+        assert!(visited[9].y > visited[8].y && visited[9].y < visited[10].y, "gallery search focus order: {visited:?}");
+        assert!(visited[10..].iter().all(|position| position.y > size.y * 0.8), "footer focus order: {visited:?}");
+    }
+
+    #[test]
+    fn gallery_search_reaches_older_files_and_skips_missing_files() {
+        let folder = tempfile::tempdir().unwrap();
+        let oldest = folder.path().join("Карта Cache.mp4");
+        std::fs::write(&oldest, b"test").unwrap();
+        let mut files = vec![oldest.clone()];
+        for index in 0..GALLERY_PAGE_SIZE {
+            let path = folder.path().join(format!("Replay-{index:02}.mp4"));
+            std::fs::write(&path, b"test").unwrap();
+            files.push(path);
+        }
+        let newest = folder.path().join("КАРТА MIRAGE.mp4");
+        std::fs::write(&newest, b"test").unwrap();
+        files.push(newest.clone());
+        files.push(folder.path().join("Карта Missing.mp4"));
+        let recent = gallery_matches(&files, "", GALLERY_PAGE_SIZE);
+        assert_eq!(recent.len(), GALLERY_PAGE_SIZE);
+        assert_eq!(recent.first(), Some(&newest));
+        assert!(!recent.contains(&oldest));
+        assert_eq!(gallery_matches(&files, "карта", GALLERY_PAGE_SIZE), [newest, oldest]);
     }
 
     #[test]
@@ -6358,11 +7080,11 @@ mod tests {
     #[test]
     fn performance_hud_uses_the_selected_screen_corner() {
         let screen = vec2(1920.0, 1080.0);
-        assert_eq!(hud_position(HudCorner::TopLeft, screen, 58.0), pos2(20.0, 20.0));
-        assert_eq!(hud_position(HudCorner::TopRight, screen, 58.0), pos2(1710.0, 20.0));
-        assert_eq!(hud_position(HudCorner::BottomLeft, screen, 58.0), pos2(20.0, 1002.0));
-        assert_eq!(hud_position(HudCorner::BottomRight, screen, 58.0), pos2(1710.0, 1002.0));
-        assert_eq!(hud_position(HudCorner::BottomRight, vec2(100.0, 40.0), 58.0), pos2(0.0, 0.0));
+        assert_eq!(hud_position(HudCorner::TopLeft, screen, vec2(190.0, 58.0)), pos2(20.0, 20.0));
+        assert_eq!(hud_position(HudCorner::TopRight, screen, vec2(190.0, 58.0)), pos2(1710.0, 20.0));
+        assert_eq!(hud_position(HudCorner::BottomLeft, screen, vec2(190.0, 58.0)), pos2(20.0, 1002.0));
+        assert_eq!(hud_position(HudCorner::BottomRight, screen, vec2(190.0, 58.0)), pos2(1710.0, 1002.0));
+        assert_eq!(hud_position(HudCorner::BottomRight, vec2(100.0, 40.0), vec2(190.0, 58.0)), pos2(0.0, 0.0));
     }
 
     #[cfg(windows)]
@@ -6495,7 +7217,7 @@ mod tests {
             move || {
                 thread::sleep(Duration::from_millis(100));
                 saved.store(true, Ordering::SeqCst);
-                let _ = tx.send(Ok(PathBuf::from("rec.mp4")));
+                let _ = tx.send(recording_saved(PathBuf::from("rec.mp4")));
             }
         });
         let path = finish_on_exit(RecState::Saving(rx));
@@ -6510,7 +7232,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let saver = thread::spawn(move || {
             thread::sleep(Duration::from_millis(10_200));
-            tx.send(Ok(PathBuf::from("slow-recording.mp4"))).unwrap();
+            tx.send(recording_saved(PathBuf::from("slow-recording.mp4"))).unwrap();
         });
         assert_eq!(finish_on_exit(RecState::Saving(rx)), Some(PathBuf::from("slow-recording.mp4")));
         saver.join().unwrap();
@@ -6524,7 +7246,7 @@ mod tests {
         // The recorded window was closed: its handle no longer exists.
         app.selected = Some(SourceId::Window(0));
         let (tx, rx) = mpsc::channel();
-        tx.send(Ok(PathBuf::from("rec.mp4"))).unwrap();
+        tx.send(recording_saved(PathBuf::from("rec.mp4"))).unwrap();
         app.rec = RecState::Saving(rx);
         app.poll(&ctx);
         let status = app.status.as_ref().expect("status");
@@ -6601,6 +7323,27 @@ mod tests {
             assert!(left >= title_pos.x - 0.5, "{language:?}: something starts at x = {left}, left of the title at {}", title_pos.x);
         }
         i18n::set(Language::Spanish);
+    }
+
+    #[test]
+    fn interrupted_recording_is_repaired_and_indexed_in_the_running_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("interrupted.mp4");
+        let (mut file, _, _) = crate::mp4::tests::fragmented();
+        file.truncate(file.len() - 42);
+        std::fs::write(&path, file).unwrap();
+
+        let mut app = test_app();
+        app.config.register_recording(path.clone()).unwrap();
+        let status = recording_final_status(path.clone(), Some("GPU stopped".into()));
+        assert!(status.error);
+        assert!(status.text.contains("GPU stopped"));
+        assert_eq!(status.file.as_deref(), Some(path.as_path()));
+        app.show_recording_saved(status);
+        assert!(!crate::mp4::repair(&path).unwrap());
+        assert!(app.config.gallery_files.contains(&path));
+        assert!(app.config.pending_recoveries.is_empty());
+        assert!(Config::load().gallery_files.contains(&path));
     }
 
     #[test]
@@ -6897,7 +7640,7 @@ mod tests {
             (SettingsPage::General, "Положение показателей"),
             (SettingsPage::Output, "Видео: MP4 · H.264"),
             (SettingsPage::Audio, "Подавление шума микрофона"),
-            (SettingsPage::Video, "Частота кадров"),
+            (SettingsPage::Video, "Экран или окно"),
             (SettingsPage::Hotkeys, "Микрофон"),
         ] {
             let ctx = egui::Context::default();

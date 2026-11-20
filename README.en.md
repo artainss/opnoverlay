@@ -2,7 +2,7 @@
 
 [Русский](README.md) | **English**
 
-A personal Windows overlay written in Rust for screen recording, instant replays, screenshots, and audio controls. Version 0.7 is available for Windows.
+A personal Windows overlay written in Rust for screen recording, instant replays, screenshots, and audio controls.
 
 ## Current status
 
@@ -20,11 +20,17 @@ Default shortcuts:
 
 Shortcuts can be changed in settings. New configurations default to a 45-second replay, “Maximum detail” quality, source resolution, and 60 FPS. Previously saved settings remain unchanged.
 
-The **Settings → Recording** page shows the size of known gallery files and associated originals, plus free disk space. Unknown files and the temporary replay buffer are excluded; file types are inferred from names.
+In opnoverlay 0.8, **Settings → Recording** shows bitrate and estimates recording and replay size. The light profile uses up to 720p at 30 FPS. The gallery searches file names, the player can seek in five-second steps, and the editor can set trim points from the playhead or adjust them in 10 ms steps. Trim exports follow frame boundaries.
 
-Version 0.7 includes a “Selected applications only” mode that excludes the general desktop mix and records selected processes and their child processes. The microphone is independent and can pick up room audio. Stop recording and replay before switching modes; reselect application instances after they restart. Testing with actual games is not complete.
+In 0.9, **Settings → Recording** saves named game profiles with capture source, quality, FPS, replay and microphone settings. Press OK to apply a profile. The disk replay limit can be set between 128 and 16,384 MiB. Replays can be shorter when the buffer reaches this limit.
 
-A prolonged GPU delay can stop a recording with an error. If the recorded portion can be finalized, the app reports its file path. The wait limit was increased after one timeout; its cause remains unknown.
+On Windows, recordings default to a single mix. **Separate audio tracks** puts the mix first, followed by desktop or selected application audio and the microphone. Trimming preserves the tracks. First-run setup offers a three-second video test without audio and a copyable result with the capture method and encoder. The test file is automatically removed.
+
+“Selected applications only” captures the chosen processes and their children. The microphone is independent. When an application restarts, you can confirm its new process in the mixer and keep the previous volume and mute state.
+
+The main panel opens on the active window's display. For full-display capture, **Preserve display stretching** fills a frame with the desktop aspect ratio when the display temporarily changes resolution. Continuous capture stops when recording, replay, and preview are off. Windows controls the capture border during capture.
+
+Video settings offer DXGI for full-display capture with the cursor disabled. Window capture and temporary display resolutions use Windows Graphics Capture. If the display mode changes during recording, the current clip is saved and capture resumes on the same display. DXGI was tested on an RTX 3050 with one monitor. Other GPUs, games and multiple monitors require separate verification.
 
 ## Building for Windows
 
@@ -36,6 +42,10 @@ cargo test --locked
 ```
 
 The executable is written to `target/release/opnoverlay.exe`. To use the FPS counter when running it manually, place `third-party/presentmon/PresentMon.exe` next to it. The installer and portable archive include PresentMon and its license. The installer is built separately with WiX; see `installer/build.ps1`.
+
+For local development on Windows with Python 3.11+, use `python tools/check.py quick` for tests with a compact cache, `build` to compile, and `smoke` to briefly capture the current screen and verify the recording, replay, and PNG. `media` validates an existing MP4. Test media is deleted after the check. `release` uses WiX and cargo-about to build the MSI, portable ZIP and SHA-256 checksums. Run `python tools/check.py --help` for options.
+
+To run the portable build, extract the ZIP to a writable folder, exit other opnoverlay instances and run `opnoverlay.exe`. The `opnoverlay.portable` marker enables local settings in `Data` and the default media folder `Media`. Windows startup is disabled for the portable build.
 
 ## Origins and license
 

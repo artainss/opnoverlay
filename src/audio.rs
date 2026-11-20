@@ -55,6 +55,7 @@ pub struct Device {
 
 
 pub struct InputShared {
+    microphone: bool,
     gain: AtomicU32,
     peak: AtomicU32,
     denoise: AtomicBool,
@@ -70,6 +71,7 @@ pub struct InputShared {
 impl InputShared {
     pub(crate) fn new(gain: f32, repaint: Option<eframe::egui::Context>) -> Self {
         Self {
+            microphone: false,
             gain: AtomicU32::new(gain.to_bits()),
             peak: AtomicU32::new(0),
             denoise: AtomicBool::new(false),
@@ -100,6 +102,14 @@ impl InputShared {
 
     pub fn error(&self) -> Option<String> {
         self.error.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_error(&self, error: Option<String>) {
+        let mut current = self.error.lock().unwrap();
+        if *current == error { return; }
+        *current = error;
+        drop(current);
+        if let Some(ctx) = &self.repaint { ctx.request_repaint(); }
     }
 
     
@@ -159,20 +169,19 @@ pub struct Input {
 impl Input {
     #[cfg(all(test, windows))]
     pub(crate) fn synthetic(kind: InputKind) -> Self {
-        Self { kind, shared: Arc::new(InputShared::new(1.0, None)), thread: None }
+        Self { kind, shared: Arc::new(InputShared { microphone: kind == InputKind::Microphone, ..InputShared::new(1.0, None) }), thread: None }
     }
     
     
     pub fn start(kind: InputKind, device_id: Option<String>, gain: f32, repaint: Option<eframe::egui::Context>) -> Self {
-        let shared = Arc::new(InputShared::new(gain, repaint));
+        let shared = Arc::new(InputShared { microphone: kind == InputKind::Microphone, ..InputShared::new(gain, repaint) });
         let thread = thread::Builder::new()
             .name(format!("audio-{kind:?}"))
             .spawn({
                 let shared = shared.clone();
                 move || {
                     if let Err(e) = crate::platform::audio::capture(kind, device_id.as_deref(), &shared) {
-                        *shared.error.lock().unwrap() = Some(e.to_string());
-                        if let Some(ctx) = &shared.repaint { ctx.request_repaint(); }
+                        shared.set_error(Some(e.to_string()));
                     }
                     shared.peak.store(0, Ordering::Relaxed);
                 }
@@ -236,11 +245,22 @@ pub struct Mixer {
 impl Mixer {
     
     
+    #[cfg(any(not(windows), test))]
     pub fn start(
         inputs: Vec<Arc<InputShared>>,
         ready: Arc<AtomicBool>,
         clock: Arc<Clock>,
         mut sink: impl FnMut(Vec<u8>) + Send + 'static,
+    ) -> Self {
+        Self::start_with_tracks(inputs, ready, clock, false, move |_, pcm| sink(pcm))
+    }
+
+    pub fn start_with_tracks(
+        inputs: Vec<Arc<InputShared>>,
+        ready: Arc<AtomicBool>,
+        clock: Arc<Clock>,
+        separate: bool,
+        mut sink: impl FnMut(usize, Vec<u8>) + Send + 'static,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let inputs = Arc::new(Mutex::new(inputs));
@@ -260,8 +280,12 @@ impl Mixer {
                     current.iter().for_each(|i| i.buffer.lock().unwrap().clear());
                     let mut produced: u64 = 0;
                     let mut mix = Vec::new();
+                    let mut microphone = Vec::new();
+                    let mut combined = Vec::new();
                     let mut backlogs = vec![Backlog::default(); current.len()];
                     let mut limiter = Limiter::new();
+                    let mut desktop_limiter = Limiter::new();
+                    let mut microphone_limiter = Limiter::new();
                     while !stop.load(Ordering::Relaxed) {
                         thread::sleep(Duration::from_millis(10));
                         let due = (clock.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as u64;
@@ -283,13 +307,24 @@ impl Mixer {
                             current = next;
                             backlogs = vec![Backlog::default(); current.len()];
                         }
-                        mix_block(&current, frames * CHANNELS, &mut mix, &mut backlogs);
-                        if limiter.process(&mut mix) {
+                        mix_block(&current, frames * CHANNELS, &mut mix, separate.then_some(&mut microphone), &mut backlogs);
+                        let playback = if separate {
+                            combined.clear();
+                            combined.extend(mix.iter().zip(&microphone).map(|(desktop, mic)| desktop + mic));
+                            &mut combined
+                        } else {
+                            &mut mix
+                        };
+                        if limiter.process(playback) {
                             *limited_at.lock().unwrap() = Some(Instant::now());
                         }
-                        let pcm =
-                            mix.iter().flat_map(|s| ((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16).to_le_bytes());
-                        sink(pcm.collect());
+                        sink(0, pcm_bytes(playback));
+                        if separate {
+                            desktop_limiter.process(&mut mix);
+                            microphone_limiter.process(&mut microphone);
+                            sink(1, pcm_bytes(&mix));
+                            sink(2, pcm_bytes(&microphone));
+                        }
                     }
                 }
             })
@@ -385,17 +420,26 @@ impl Default for Backlog {
     }
 }
 
-fn mix_block(inputs: &[Arc<InputShared>], samples: usize, out: &mut Vec<f32>, backlogs: &mut [Backlog]) {
+fn pcm_bytes(samples: &[f32]) -> Vec<u8> {
+    samples.iter().flat_map(|sample| ((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16).to_le_bytes()).collect()
+}
+
+fn mix_block(inputs: &[Arc<InputShared>], samples: usize, out: &mut Vec<f32>, mut microphone: Option<&mut Vec<f32>>, backlogs: &mut [Backlog]) {
     out.clear();
     out.resize(samples, 0.0);
+    if let Some(microphone) = microphone.as_deref_mut() {
+        microphone.clear();
+        microphone.resize(samples, 0.0);
+    }
     for (input, backlog) in inputs.iter().zip(backlogs) {
+        let target = if input.microphone { microphone.as_deref_mut().unwrap_or(&mut *out) } else { &mut *out };
         let gain = input.gain();
         let mut buf = input.buffer.lock().unwrap();
         
         let excess = buf.len().saturating_sub(samples + MAX_LATENCY);
         buf.drain(..excess);
         let take = buf.len().min(samples);
-        for (o, s) in out.iter_mut().zip(buf.drain(..take)) {
+        for (o, s) in target.iter_mut().zip(buf.drain(..take)) {
             *o += s * gain;
         }
         
@@ -412,6 +456,22 @@ fn mix_block(inputs: &[Arc<InputShared>], samples: usize, out: &mut Vec<f32>, ba
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn microphone_samples_stay_out_of_the_game_track() {
+        let desktop = Arc::new(InputShared::new(1.0, None));
+        let microphone = Arc::new(InputShared { microphone: true, ..InputShared::new(1.0, None) });
+        desktop.deliver(vec![0.5, -0.5]);
+        microphone.deliver(vec![0.25, -0.25]);
+        let mut game = Vec::new();
+        let mut mic = Vec::new();
+        let mut backlogs = [Backlog::default(), Backlog::default()];
+        mix_block(&[desktop.clone(), microphone.clone()], 2, &mut game, Some(&mut mic), &mut backlogs);
+        assert_eq!(game, [0.5, -0.5]);
+        assert_eq!(mic, [0.25, -0.25]);
+        assert!(desktop.buffer.lock().unwrap().is_empty());
+        assert!(microphone.buffer.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn mixer_adds_replaces_and_removes_an_input_during_capture() {
@@ -460,7 +520,7 @@ mod tests {
         let a = input_with(&[0.5, 0.5], 1.0);
         let b = input_with(&[0.2, 0.2, 0.2, 0.2], 0.5);
         let mut out = Vec::new();
-        mix_block(&[a.clone(), b], 4, &mut out, &mut [Backlog::default(), Backlog::default()]);
+        mix_block(&[a.clone(), b], 4, &mut out, None, &mut [Backlog::default(), Backlog::default()]);
         assert_eq!(out, vec![0.6, 0.6, 0.1, 0.1]);
         assert!(a.buffer.lock().unwrap().is_empty());
     }
@@ -479,7 +539,7 @@ mod tests {
         let samples = sine(0.7, 0.5).len();
         let inputs = [input_with(&sine(0.7, 0.5), 1.0), input_with(&sine(0.7, 0.5), 1.0)];
         let mut mix = Vec::new();
-        mix_block(&inputs, samples, &mut mix, &mut [Backlog::default(), Backlog::default()]);
+        mix_block(&inputs, samples, &mut mix, None, &mut [Backlog::default(), Backlog::default()]);
         let summed = mix.clone();
         let limited = Limiter::new().process(&mut mix);
         assert!(mix.iter().all(|s| s.abs() <= 1.0), "nothing left over full scale");
@@ -541,7 +601,7 @@ mod tests {
                 105 => deliver(6),
                 _ => deliver(1),
             }
-            mix_block(std::slice::from_ref(&input), block, &mut out, &mut backlog);
+            mix_block(std::slice::from_ref(&input), block, &mut out, None, &mut backlog);
         }
         let left = input.buffer.lock().unwrap().len();
         assert!(left <= CUSHION, "{left} samples still waiting: the delay stayed");
@@ -552,7 +612,7 @@ mod tests {
         let data: Vec<f32> = (0..(MAX_LATENCY + 10)).map(|i| i as f32).collect();
         let a = input_with(&data, 1.0);
         let mut out = Vec::new();
-        mix_block(std::slice::from_ref(&a), 4, &mut out, &mut [Backlog::default()]);
+        mix_block(std::slice::from_ref(&a), 4, &mut out, None, &mut [Backlog::default()]);
         
         assert_eq!(out[0], 6.0);
         assert_eq!(a.buffer.lock().unwrap().len(), MAX_LATENCY);

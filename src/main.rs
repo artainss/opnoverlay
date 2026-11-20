@@ -100,26 +100,40 @@ fn selftest(args: &[String]) -> Result<(), String> {
     let shot = args.iter().any(|a| a == "shot");
     let region = args.iter().any(|a| a == "region").then_some(config::Region { x: 480, y: 270, width: 960, height: 540 });
     let webcam = args.iter().any(|a| a == "webcam");
-    let resolution = if args.iter().any(|a| a == "720") { config::Resolution::P720 } else { config::Resolution::Native };
+    let mut profile = config::Config {
+        fps: 60,
+        quality: config::Quality::Medium,
+        resolution: if args.iter().any(|a| a == "720") { config::Resolution::P720 } else { config::Resolution::Native },
+        ..Default::default()
+    };
+    if args.iter().any(|a| a == "light-profile") { profile.apply_light_profile(); }
 
     let source = capture::list_sources().into_iter().next().ok_or("no capture sources")?;
     let mic_only = args.iter().any(|a| a == "mic-only");
     let mix_mic = args.iter().any(|a| a == "mix-mic");
     let synthetic_tone = args.iter().any(|a| a == "synthetic-tone");
+    let desktop_duplication = cfg!(windows) && args.iter().any(|a| a == "dxgi");
+    let separate_audio_tracks = cfg!(windows) && args.iter().any(|a| a == "separate-audio");
     let mut inputs = Vec::new();
     if !mic_only { inputs.push(audio::Input::start(audio::InputKind::System, None, 1.0, None)); }
     if mic_only || mix_mic { inputs.push(audio::Input::start(audio::InputKind::Microphone, None, 1.0, None)); }
     let session = capture::Session::start(
         capture::SessionOptions {
             source: source.id,
-            fps: 60,
-            cursor: true,
+            fps: profile.fps,
+            cursor: !desktop_duplication,
+            #[cfg(windows)]
+            desktop_duplication,
             preview_fps: if preview { 5 } else { 0 },
             record: Some(capture::RecordConfig {
-                quality: config::Quality::Medium,
+                quality: profile.quality,
                 custom_bitrate_mbps: 12,
-                resolution,
+                resolution: profile.resolution,
+                #[cfg(windows)]
+                display_canvas: region.is_none().then(|| capture::desktop_resolution(source.id)).flatten(),
                 audio: true,
+                #[cfg(windows)]
+                separate_audio_tracks,
                 region,
                 overlay: webcam.then_some((camera::Corner::BottomRight, camera::CameraSize::Medium)),
             }),
@@ -129,26 +143,34 @@ fn selftest(args: &[String]) -> Result<(), String> {
     {
         let mut outputs = session.shared.outputs.lock().unwrap();
         outputs.start_file(out.clone());
-        if replay && replay_disk { outputs.set_replay_on_disk(3)?; } else { outputs.set_replay(replay.then_some(3)); }
+        if replay && replay_disk { outputs.set_replay_on_disk(3, Default::default(), profile.replay_disk_limit_bytes())?; } else { outputs.set_replay(replay.then_some(3)); }
     }
     let shared = session.shared.clone();
-    let mut tone_frame = 0u64;
-    let mixer = audio::Mixer::start(
+    let mut tone_frames = [0u64; 3];
+    let mixer = audio::Mixer::start_with_tracks(
         inputs.iter().map(|input| input.shared.clone()).collect(),
         shared.encoder_ready.clone(),
         shared.clock.clone(),
-        move |mut pcm| {
+        separate_audio_tracks,
+        move |track, mut pcm| {
             if synthetic_tone {
+                let tone_frame = &mut tone_frames[track];
                 let (frames, _) = pcm.as_chunks_mut::<4>();
                 for frame in frames {
-                    let phase = tone_frame as f64 * 440.0 * std::f64::consts::TAU / 48_000.0;
-                    let sample = ((phase.sin() * 0.25) * f64::from(i16::MAX)) as i16;
+                    let phase = *tone_frame as f64 * std::f64::consts::TAU / 48_000.0;
+                    let value = if separate_audio_tracks && track == 0 {
+                        ((phase * 440.0).sin() + (phase * 660.0).sin()) * 0.18
+                    } else { (phase * if track == 2 { 660.0 } else { 440.0 }).sin() * 0.25 };
+                    let sample = (value * f64::from(i16::MAX)) as i16;
                     frame[..2].copy_from_slice(&sample.to_le_bytes());
                     frame[2..].copy_from_slice(&sample.to_le_bytes());
-                    tone_frame += 1;
+                    *tone_frame += 1;
                 }
             }
             if let Some(enc) = shared.encoder.lock().unwrap().as_ref() {
+                #[cfg(windows)]
+                enc.push_audio_track(track, pcm);
+                #[cfg(not(windows))]
                 enc.push_audio(pcm);
             }
         },
@@ -181,12 +203,16 @@ fn selftest(args: &[String]) -> Result<(), String> {
     drop(mixer);
 
     let captured = session.shared.frames.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(windows)]
+    println!("Capture: {}", session.backend_name());
     let last_preview = session.shared.preview.lock().unwrap().take();
     let sizes = *session.shared.sizes.lock().unwrap();
     let (encoder, err) = session.stop();
     let encoder = encoder.ok_or_else(|| err.unwrap_or_else(|| "no frames captured".into()))?;
     let (encoded, lagged) = encoder.stats();
     let encoder_name = encoder.name().to_owned();
+    #[cfg(windows)]
+    println!("GPU synchronization: {}", encoder.completion_method());
     encoder.finish().ok_or("nothing was recorded")?.finish()?;
     if let Some(replay) = replay {
         let path = out.with_file_name(format!("{}-replay.mp4", out.file_stem().unwrap_or_default().display()));

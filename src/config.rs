@@ -1,5 +1,6 @@
 //! Persistent user settings stored as JSON in %APPDATA%\screen-overlay\settings.json.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,26 @@ pub enum HudCorner {
 impl HudCorner {
     pub const ALL: [Self; 4] = [Self::TopLeft, Self::TopRight, Self::BottomLeft, Self::BottomRight];
 
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+pub enum HudSize {
+    Compact,
+    #[default]
+    Normal,
+    Large,
+}
+
+impl HudSize {
+    pub const ALL: [Self; 3] = [Self::Compact, Self::Normal, Self::Large];
+
+    pub fn scale(self) -> f32 {
+        match self {
+            Self::Compact => 0.85,
+            Self::Normal => 1.0,
+            Self::Large => 1.25,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -167,8 +188,82 @@ impl ScreenshotFormat {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecordingProfile {
+    pub source: Option<ProfileSource>,
+    fps: u32,
+    resolution: Resolution,
+    quality: Quality,
+    custom_bitrate_mbps: u32,
+    cursor: bool,
+    stretch_display: bool,
+    desktop_duplication: bool,
+    replay_seconds: u32,
+    replay_storage: ReplayStorage,
+    replay_disk_limit_mib: u32,
+    system_audio: bool,
+    mic: bool,
+    mic_muted: bool,
+    mic_volume: f32,
+    mic_denoise: bool,
+    mic_device: Option<String>,
+    separate_audio_tracks: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProfileSource {
+    Display(String),
+    Window(String),
+}
+
+impl RecordingProfile {
+    pub fn from_config(c: &Config, replay_seconds: u32, source: Option<ProfileSource>) -> Self {
+        Self {
+            source,
+            fps: c.fps,
+            resolution: c.resolution,
+            quality: c.quality,
+            custom_bitrate_mbps: c.custom_bitrate_mbps,
+            cursor: c.cursor,
+            stretch_display: c.stretch_display,
+            desktop_duplication: c.desktop_duplication,
+            replay_seconds,
+            replay_storage: c.replay_storage,
+            replay_disk_limit_mib: c.replay_disk_limit_mib,
+            system_audio: c.system_audio,
+            mic: c.mic,
+            mic_muted: c.mic_muted,
+            mic_volume: c.mic_volume,
+            mic_denoise: c.mic_denoise,
+            mic_device: c.mic_device.clone(),
+            separate_audio_tracks: c.separate_audio_tracks,
+        }
+    }
+
+    pub fn apply(&self, c: &mut Config) {
+        c.fps = self.fps.clamp(1, 240);
+        c.resolution = self.resolution;
+        c.quality = self.quality;
+        c.custom_bitrate_mbps = self.custom_bitrate_mbps.clamp(1, 80);
+        c.cursor = self.cursor;
+        c.stretch_display = self.stretch_display;
+        c.desktop_duplication = self.desktop_duplication;
+        c.replay_seconds = self.replay_seconds.clamp(1, 86_400);
+        c.replay_storage = self.replay_storage;
+        c.replay_disk_limit_mib = self.replay_disk_limit_mib;
+        c.system_audio = self.system_audio;
+        c.mic = self.mic;
+        c.mic_muted = self.mic_muted;
+        c.mic_volume = self.mic_volume;
+        c.mic_denoise = self.mic_denoise;
+        c.mic_device.clone_from(&self.mic_device);
+        c.separate_audio_tracks = self.separate_audio_tracks;
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub recording_profiles: BTreeMap<String, RecordingProfile>,
     /// `None` follows the Windows display language.
     pub language: Option<Language>,
     /// Keep the obs-lite window out of every capture, including its own preview.
@@ -191,6 +286,8 @@ pub struct Config {
     pub hud_enabled: bool,
     pub hud_cpu: bool,
     pub hud_fps: bool,
+    pub hud_frame_time: bool,
+    pub hud_size: HudSize,
     pub hud_memory: bool,
     pub hud_gpu: bool,
     pub hud_gpu_temperature: bool,
@@ -198,6 +295,8 @@ pub struct Config {
     pub hud_corner: HudCorner,
     pub fps: u32,
     pub resolution: Resolution,
+    pub stretch_display: bool,
+    pub desktop_duplication: bool,
     pub quality: Quality,
     pub custom_bitrate_mbps: u32,
     pub cursor: bool,
@@ -213,12 +312,14 @@ pub struct Config {
     pub app_audio: Option<String>,
     #[serde(default)]
     pub selected_audio_only: bool,
+    pub separate_audio_tracks: bool,
     pub app_volume: f32,
     pub app_muted: bool,
     /// WASAPI endpoint IDs; `None` follows the Windows default device.
     pub system_device: Option<String>,
     pub mic_device: Option<String>,
     pub source_label: Option<String>,
+    pub source_display: Option<String>,
     /// Record only this part of the source.
     pub region: Option<Region>,
     /// Webcam overlaid on the recording.
@@ -227,6 +328,7 @@ pub struct Config {
     pub auto_start_replay: bool,
     pub auto_start_windows: bool,
     pub replay_storage: ReplayStorage,
+    pub replay_disk_limit_mib: u32,
     pub setup_complete: bool,
     /// Seconds the replay buffer keeps.
     pub replay_seconds: u32,
@@ -237,7 +339,9 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let media = portable_dir().map(|path| path.join("Media")).unwrap_or_else(|| dirs::video_dir().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from(".")).join("opnoverlay"));
         Self {
+            recording_profiles: BTreeMap::new(),
             language: None,
             hide_from_capture: true,
             minimize_to_tray: false,
@@ -245,9 +349,9 @@ impl Default for Config {
             hide_notifications_from_capture: true,
             check_updates: false,
             skipped_version: None,
-            output_dir: dirs::video_dir().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from(".")).join("opnoverlay"),
-            replay_dir: dirs::video_dir().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from(".")).join("opnoverlay"),
-            screenshot_dir: dirs::video_dir().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from(".")).join("opnoverlay"),
+            output_dir: media.clone(),
+            replay_dir: media.clone(),
+            screenshot_dir: media,
             screenshot_format: ScreenshotFormat::Png,
             jpeg_quality: 85,
             video_name_template: "[ГГГГ-ММ-ДД] [ЧЧ-ММ-СС] — Video".into(),
@@ -255,6 +359,8 @@ impl Default for Config {
             hud_enabled: false,
             hud_cpu: true,
             hud_fps: false,
+            hud_frame_time: false,
+            hud_size: HudSize::default(),
             hud_memory: true,
             hud_gpu: true,
             hud_gpu_temperature: true,
@@ -262,6 +368,8 @@ impl Default for Config {
             hud_corner: HudCorner::default(),
             fps: 60,
             resolution: Resolution::Native,
+            stretch_display: true,
+            desktop_duplication: false,
             quality: Quality::High,
             custom_bitrate_mbps: 12,
             cursor: true,
@@ -274,17 +382,20 @@ impl Default for Config {
             mic_denoise: false,
             app_audio: None,
             selected_audio_only: false,
+            separate_audio_tracks: false,
             app_volume: 1.0,
             app_muted: false,
             system_device: None,
             mic_device: None,
             source_label: None,
+            source_display: None,
             region: None,
             camera: None,
             hotkeys: Hotkeys::default(),
             auto_start_replay: true,
             auto_start_windows: false,
             replay_storage: ReplayStorage::Memory,
+            replay_disk_limit_mib: 2048,
             setup_complete: false,
             replay_seconds: 45,
             last_recording: None,
@@ -302,11 +413,33 @@ pub(crate) fn path() -> Option<PathBuf> {
     #[cfg(test)]
     let root = TEST_CONFIG_ROOT.with(|root| root.as_ref().map(|root| root.path().to_owned()))?;
     #[cfg(not(test))]
-    let root = std::env::var_os("OPNOVERLAY_CONFIG_DIR").map(PathBuf::from).filter(|path| path.is_absolute()).or_else(dirs::config_dir)?;
+    let root = std::env::var_os("OPNOVERLAY_CONFIG_DIR").map(PathBuf::from).filter(|path| path.is_absolute()).or_else(|| portable_dir().map(|dir| dir.join("Data"))).or_else(dirs::config_dir)?;
     Some(root.join("screen-overlay").join("settings.json"))
 }
 
+pub(crate) fn portable_dir() -> Option<PathBuf> {
+    static DIRECTORY: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIRECTORY.get_or_init(|| {
+        let executable = std::env::current_exe().ok()?;
+        let directory = executable.parent()?;
+        directory.join("opnoverlay.portable").is_file().then(|| directory.to_owned())
+    }).clone()
+}
+
 impl Config {
+    pub const REPLAY_DISK_LIMIT_MIB: std::ops::RangeInclusive<u32> = 128..=16_384;
+
+    pub fn replay_disk_limit_bytes(&self) -> u64 {
+        let limit = Self::REPLAY_DISK_LIMIT_MIB;
+        u64::from(self.replay_disk_limit_mib.clamp(*limit.start(), *limit.end())) << 20
+    }
+
+    pub fn apply_light_profile(&mut self) {
+        self.quality = Quality::Low;
+        self.resolution = Resolution::P720;
+        self.fps = 30;
+    }
+
     pub fn load() -> Self {
         path().and_then(|p| fs::read_to_string(p).ok()).and_then(|s| Self::parse(&s)).unwrap_or_default()
     }
@@ -394,6 +527,31 @@ fn try_lock(path: &Path) -> Option<File> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn game_profile_round_trip_preserves_global_settings() {
+        let mut config = super::Config::default();
+        config.apply_light_profile();
+        config.mic = true;
+        config.mic_device = Some("microphone-id".into());
+        config.replay_storage = super::ReplayStorage::Disk;
+        config.replay_disk_limit_mib = 512;
+        let source = super::ProfileSource::Window("DDNet Client".into());
+        let profile = super::RecordingProfile::from_config(&config, 75, Some(source.clone()));
+        config.recording_profiles.insert("DDNet".into(), profile);
+        let read = super::Config::parse(&serde_json::to_string(&config).unwrap()).unwrap();
+        let profile = &read.recording_profiles["DDNet"];
+        assert_eq!(profile.source.as_ref(), Some(&source));
+        let mut other = super::Config { selected_audio_only: true, ..super::Config::default() };
+        other.hotkeys.menu = Some("Ctrl+Alt+F23".into());
+        profile.apply(&mut other);
+        assert_eq!(other.hotkeys.menu.as_deref(), Some("Ctrl+Alt+F23"));
+        assert!(other.selected_audio_only);
+        assert_eq!((other.resolution, other.fps, other.replay_seconds), (super::Resolution::P720, 30, 75));
+        assert_eq!((other.replay_storage, other.replay_disk_limit_mib), (super::ReplayStorage::Disk, 512));
+        assert!(other.mic);
+        assert_eq!(other.mic_device.as_deref(), Some("microphone-id"));
+    }
+
     use super::*;
 
     #[test]

@@ -2,12 +2,15 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Diagnostics::Etw::{CONTROLTRACE_HANDLE, ControlTraceW, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_PROPERTIES};
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
@@ -58,25 +61,61 @@ impl CsvColumns {
     }
 }
 
-pub fn average_fps(frame_times_ms: &[f64]) -> Option<f64> {
-    if frame_times_ms.is_empty() || frame_times_ms.iter().any(|time| !time.is_finite() || *time <= 0.0) { return None; }
-    Some(1000.0 * frame_times_ms.len() as f64 / frame_times_ms.iter().sum::<f64>())
+#[derive(Clone, Copy, Debug)]
+pub struct FrameTiming {
+    pub frame_ms: f64,
+}
+
+impl FrameTiming {
+    pub fn fps(self) -> f64 { 1000.0 / self.frame_ms }
+}
+
+#[derive(Default)]
+struct FrameBucket {
+    frames: u32,
+    total_ms: f64,
+}
+
+impl FrameBucket {
+    fn push(&mut self, milliseconds: f64) {
+        self.frames += 1;
+        self.total_ms += milliseconds;
+    }
+
+    fn timing(&self) -> Option<FrameTiming> {
+        (self.frames > 0).then(|| FrameTiming { frame_ms: self.total_ms / f64::from(self.frames) })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct FrameSample {
+    at: Instant,
+    process: u32,
+    timing: Option<FrameTiming>,
+}
+
+impl FrameSample {
+    pub fn current(self, fixed_target: Option<u32>) -> Option<FrameTiming> {
+        if self.at.elapsed() >= Duration::from_secs(4) || fixed_target.or_else(foreground_process).is_some_and(|pid| pid != self.process) {
+            return None;
+        }
+        self.timing
+    }
 }
 
 pub struct FpsMonitor {
     stop: Arc<AtomicBool>,
-    samples: mpsc::Receiver<(Instant, Option<f64>)>,
+    samples: mpsc::Receiver<FrameSample>,
+    trace: Arc<Mutex<Option<(String, Child)>>>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 impl FpsMonitor {
-    pub fn start() -> Self {
-        Self::start_for_target(None)
-    }
-
-    fn start_for_target(fixed_target: Option<u32>) -> Self {
+    pub fn start(fixed_target: Option<u32>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
+        let trace = Arc::new(Mutex::new(None::<(String, Child)>));
+        let worker_trace = trace.clone();
         let (tx, samples) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
             let mut last_target = None;
@@ -85,56 +124,89 @@ impl FpsMonitor {
                 let Some(target) = last_target else { thread::sleep(Duration::from_secs(1)); continue };
                 let generation = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
                 let session = format!("opnoverlay-fps-{}-{generation}", std::process::id());
+                let report = |timing| {
+                    let _ = tx.try_send(FrameSample { at: Instant::now(), process: target, timing });
+                };
                 let Some(executable) = presentmon_path() else {
-                    let _ = tx.try_send((Instant::now(), None));
+                    report(None);
                     break;
                 };
                 let started = Instant::now();
+                let mut active = worker_trace.lock().unwrap();
+                if worker_stop.load(Ordering::Acquire) { break; }
                 let mut child = match Command::new(executable)
                     .args(["--process_id", &target.to_string(), "--output_stdout", "--no_console_stats", "--v2_metrics", "--exclude_dropped", "--no_track_gpu", "--no_track_input", "--timed", "6", "--terminate_after_timed", "--terminate_on_proc_exit", "--session_name", &session])
                     .creation_flags(0x08000000)
                     .stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null()).spawn() {
                         Ok(child) => child,
-                        Err(_) => { let _ = tx.try_send((Instant::now(), None)); thread::sleep(Duration::from_secs(3)); continue; }
+                        Err(_) => {
+                            drop(active);
+                            report(None);
+                            thread::sleep(Duration::from_secs(3));
+                            continue;
+                        }
                     };
+                let output = child.stdout.take();
+                *active = Some((session, child));
+                drop(active);
                 let mut had_frames = false;
-                if let Some(output) = child.stdout.take() {
+                if let Some(output) = output {
                     let mut lines = BufReader::new(output).lines();
                     let columns = lines.next().and_then(Result::ok).and_then(|header| CsvColumns::from_header(&header));
                     if let Some(columns) = columns {
-                        let mut buckets: HashMap<String, Vec<f64>> = HashMap::new();
+                        let mut buckets: HashMap<String, FrameBucket> = HashMap::new();
                         let mut last_report = Instant::now();
                         for line in lines.map_while(Result::ok) {
                             if worker_stop.load(Ordering::Acquire) { break; }
                             if let Some((chain, duration)) = columns.frame(&line, target) {
                                 had_frames = true;
-                                let values = buckets.entry(chain).or_default();
-                                if values.len() < 1000 { values.push(duration); }
+                                buckets.entry(chain).or_default().push(duration);
                             }
                             if last_report.elapsed() >= Duration::from_secs(1) {
-                                let fps = buckets.values().max_by_key(|values| values.len()).and_then(|values| average_fps(values));
-                                let _ = tx.try_send((Instant::now(), fps));
+                                let timing = buckets.values().max_by_key(|bucket| bucket.frames).and_then(FrameBucket::timing);
+                                report(timing);
                                 buckets.clear();
                                 last_report = Instant::now();
                             }
                         }
                     }
                 }
-                let success = child.wait().is_ok_and(|status| status.success());
-                let _ = tx.try_send((Instant::now(), None));
+                let success = loop {
+                    let mut active = worker_trace.lock().unwrap();
+                    let Some((_, child)) = active.as_mut() else { return };
+                    match child.try_wait() {
+                        Ok(Some(status)) => { *active = None; break status.success(); }
+                        Err(_) => {
+                            let (name, child) = active.take().unwrap();
+                            drop(active);
+                            stop_trace(name, child);
+                            break false;
+                        }
+                        Ok(None) => {}
+                    }
+                    drop(active);
+                    thread::sleep(Duration::from_millis(20));
+                };
+                if !success || !had_frames { report(None); }
                 let until = Instant::now() + retry_delay(success, started.elapsed(), had_frames);
                 while !worker_stop.load(Ordering::Acquire) && Instant::now() < until {
                     thread::sleep(Duration::from_millis(100));
                 }
             }
         });
-        Self { stop, samples, worker: Some(worker) }
+        Self { stop, samples, trace, worker: Some(worker) }
     }
 
-    pub fn latest(&self) -> Option<(Instant, Option<f64>)> {
+    pub fn latest(&self) -> Option<FrameSample> {
         let mut latest = None;
         while let Ok(sample) = self.samples.try_recv() { latest = Some(sample); }
         latest
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        let active = self.trace.lock().unwrap().take();
+        if let Some((name, child)) = active { stop_trace(name, child); }
     }
 }
 
@@ -146,7 +218,27 @@ fn retry_delay(success: bool, ran_for: Duration, had_frames: bool) -> Duration {
 }
 
 impl Drop for FpsMonitor {
-    fn drop(&mut self) { self.stop.store(true, Ordering::Release); let _ = self.worker.take(); }
+    fn drop(&mut self) {
+        self.stop();
+        let _ = self.worker.take();
+    }
+}
+
+fn stop_trace(name: String, mut child: Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+    let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    #[repr(C)]
+    struct TraceProperties {
+        properties: EVENT_TRACE_PROPERTIES,
+        session_name: [u16; 1024],
+        file_name: [u16; 1024],
+    }
+    let mut trace = TraceProperties { properties: EVENT_TRACE_PROPERTIES::default(), session_name: [0; 1024], file_name: [0; 1024] };
+    trace.properties.Wnode.BufferSize = size_of::<TraceProperties>() as u32;
+    trace.properties.LoggerNameOffset = std::mem::offset_of!(TraceProperties, session_name) as u32;
+    trace.properties.LogFileNameOffset = std::mem::offset_of!(TraceProperties, file_name) as u32;
+    unsafe { let _ = ControlTraceW(CONTROLTRACE_HANDLE::default(), PCWSTR(name.as_ptr()), &mut trace.properties, EVENT_TRACE_CONTROL_STOP); }
 }
 
 fn presentmon_path() -> Option<PathBuf> {
@@ -161,7 +253,10 @@ fn presentmon_path() -> Option<PathBuf> {
 }
 
 fn foreground_process() -> Option<u32> {
-    let window = unsafe { GetForegroundWindow() };
+    window_process(unsafe { GetForegroundWindow() })
+}
+
+pub fn window_process(window: HWND) -> Option<u32> {
     if window.0.is_null() { return None; }
     let mut pid = 0;
     unsafe { GetWindowThreadProcessId(window, Some(&mut pid)); }
@@ -186,10 +281,26 @@ mod tests {
 
     #[test]
     fn fps_uses_total_frame_time_instead_of_averaging_reciprocals() {
-        assert!((average_fps(&[10.0, 30.0]).unwrap() - 50.0).abs() < 0.001);
-        assert!(average_fps(&[]).is_none());
-        assert!(average_fps(&[10.0, 0.0]).is_none());
-        assert!(average_fps(&[f64::NAN]).is_none());
+        let mut bucket = FrameBucket::default();
+        assert!(bucket.timing().is_none());
+        bucket.push(10.0);
+        bucket.push(30.0);
+        let timing = bucket.timing().unwrap();
+        assert_eq!(timing.frame_ms, 20.0);
+        assert_eq!(timing.fps(), 50.0);
+    }
+
+    #[test]
+    fn a_frame_sample_is_valid_only_for_its_target_and_while_fresh() {
+        let sample = FrameSample {
+            at: Instant::now(),
+            process: 42,
+            timing: Some(FrameTiming { frame_ms: 16.0 }),
+        };
+        assert_eq!(sample.current(Some(42)).unwrap().frame_ms, 16.0);
+        assert!(sample.current(Some(43)).is_none());
+        let expired = FrameSample { at: sample.at - Duration::from_secs(5), ..sample };
+        assert!(expired.current(Some(42)).is_none());
     }
 
     #[test]
@@ -204,18 +315,19 @@ mod tests {
     #[ignore]
     fn captures_displayed_fps_and_stops_without_leaving_a_worker() {
         let target = std::env::var("OPNOVERLAY_FPS_TEST_PID").unwrap().parse().unwrap();
-        let mut monitor = FpsMonitor::start_for_target(Some(target));
+        let mut monitor = FpsMonitor::start(Some(target));
         let until = Instant::now() + Duration::from_secs(15);
         let mut measured = false;
         while Instant::now() < until {
-            if let Some((_, Some(fps))) = monitor.latest() {
-                assert!(fps > 0.0 && fps < 1000.0);
+            if let Some(FrameSample { timing: Some(timing), .. }) = monitor.latest() {
+                assert!(timing.fps() > 0.0 && timing.fps() < 1000.0);
+                println!("Displayed FPS: {:.2}, displayed frame time: {:.2} ms", timing.fps(), timing.frame_ms);
                 measured = true;
                 break;
             }
             thread::sleep(Duration::from_millis(100));
         }
-        monitor.stop.store(true, Ordering::Release);
+        monitor.stop();
         monitor.worker.take().unwrap().join().unwrap();
         assert!(measured, "no displayed FPS samples for isolated test process");
     }

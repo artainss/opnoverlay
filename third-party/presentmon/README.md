@@ -4,4 +4,4 @@
 
 Source and build instructions: https://github.com/GameTechDev/PresentMon/tree/v2.6.0
 
-The accompanying `LICENSE.txt` is the upstream MIT license. FPS measurement is optional and runs this executable only when the FPS indicator is enabled. Windows may require permission to start event tracing.
+The accompanying `LICENSE.txt` is the upstream MIT license. The optional HUD runs this executable when FPS or displayed frame time is enabled. It measures the selected window or, when capturing a display, the foreground application. Windows may require permission to start event tracing.

@@ -5,6 +5,8 @@ use crate::camera::{CameraSize, Corner};
 use crate::config::{Quality, Region, Resolution, ScreenshotFormat};
 
 pub use crate::platform::capture::{Session, list_audio_apps, list_sources};
+#[cfg(windows)]
+pub use crate::platform::capture::{desktop_resolution, display_key, snapshot_once};
 #[cfg(target_os = "linux")]
 pub use crate::platform::capture::forget_choice;
 
@@ -49,7 +51,11 @@ pub struct RecordConfig {
     pub quality: Quality,
     pub custom_bitrate_mbps: u32,
     pub resolution: Resolution,
+    #[cfg(windows)]
+    pub display_canvas: Option<(u32, u32)>,
     pub audio: bool,
+    #[cfg(windows)]
+    pub separate_audio_tracks: bool,
     pub region: Option<Region>,
     pub overlay: Option<(Corner, CameraSize)>,
 }
@@ -70,6 +76,8 @@ pub struct SessionOptions {
     pub source: SourceId,
     pub fps: u32,
     pub cursor: bool,
+    #[cfg(windows)]
+    pub desktop_duplication: bool,
     /// Preview updates per second; 0 disables the preview.
     pub preview_fps: u32,
     pub record: Option<RecordConfig>,

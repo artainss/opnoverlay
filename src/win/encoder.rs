@@ -8,6 +8,7 @@
 //! only (see `media::Outputs`), so the replay buffer goes on.
 
 use std::collections::VecDeque;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -15,17 +16,18 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use windows::Win32::Foundation::{ERROR_TIMEOUT, RECT};
+use windows::Win32::Foundation::{ERROR_TIMEOUT, HANDLE, RECT, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_QUERY_DESC, D3D11_QUERY_EVENT,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11DeviceContext, ID3D11Query,
+    D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX,
+    D3D11_FENCE_FLAG_NONE, D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    ID3D11Device, ID3D11Device5, ID3D11DeviceContext, ID3D11DeviceContext4, ID3D11Fence, ID3D11Query,
     ID3D11RenderTargetView, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::IMFMediaType;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
-use windows::core::{BOOL, HRESULT};
-use windows_capture::frame::Frame;
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::core::{BOOL, HRESULT, Interface, PCWSTR};
 
 use crate::camera::{self, CameraSize, Corner, PixelRect};
 use crate::capture::{Placement, placement};
@@ -44,15 +46,17 @@ const IN_FLIGHT: usize = 4;
 pub struct EncoderSettings {
     pub input: (u32, u32),
     pub output: (u32, u32),
+    pub stretch_display: bool,
     pub fps: u32,
     pub bitrate: u32,
-    pub audio: bool,
+    pub audio_tracks: usize,
     /// Where the webcam goes, if there is one.
     pub overlay: Option<(Corner, CameraSize)>,
 }
 
 /// A scaler and the frame size it was made for; no scaler if the GPU cannot scale.
 type SizedScaler = ((u32, u32), Option<Com<Scaler>>);
+type AudioBlock = (usize, Vec<u8>);
 
 /// COM pointer used from several threads; D3D11 devices are free-threaded and the
 /// immediate context is multithread-protected (see `capture::keep_last_frame`).
@@ -69,13 +73,21 @@ impl Muxer for Com<Mp4> {
     type Format = Com<IMFMediaType>;
 
     fn create(path: &Path, video: &Self::Format, audio: Option<&Self::Format>, start: i64) -> Result<Self, String> {
+        Self::create_audio_tracks(path, video, audio.map_or(&[], std::slice::from_ref), start)
+    }
+
+    fn create_audio_tracks(path: &Path, video: &Self::Format, audio: &[Self::Format], start: i64) -> Result<Self, String> {
         // Replays are saved from a thread of their own.
         let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        Mp4::create(path, &video.0, audio.map(|a| &a.0), start).map(Com).map_err(|e| e.to_string())
+        Mp4::create(path, &video.0, audio.iter().map(|a| &a.0), start).map(Com).map_err(|e| e.to_string())
     }
 
     fn write(&self, video: bool, packet: &Packet) -> Result<(), String> {
-        self.0.write(video, packet).map_err(|e| e.to_string())
+        self.0.write((!video).then_some(0), packet).map_err(|e| e.to_string())
+    }
+
+    fn write_audio_track(&self, track: usize, packet: &Packet) -> Result<(), String> {
+        self.0.write(Some(track), packet).map_err(|e| e.to_string())
     }
 
     fn finish(self) -> Result<(), String> {
@@ -89,12 +101,55 @@ struct Canvas {
     target: Com<ID3D11RenderTargetView>,
     context: Com<ID3D11DeviceContext>,
     converter: Com<Converter>,
-    /// Signals when the GPU has finished a conversion.
-    converted: Com<ID3D11Query>,
+    completion: ConversionCompletion,
     /// Set once the first frame has been drawn.
     ready: AtomicBool,
     /// Keeps each group of GPU commands (a frame with its overlay, or a conversion) together.
     lock: Mutex<()>,
+}
+
+enum ConversionCompletion {
+    Fence(GpuFence),
+    Query(Com<ID3D11Query>),
+}
+
+struct GpuFence {
+    fence: Com<ID3D11Fence>,
+    context: Com<ID3D11DeviceContext4>,
+    event: OwnedHandle,
+    value: AtomicU64,
+}
+
+impl GpuFence {
+    fn new(device: &ID3D11Device, context: &ID3D11DeviceContext) -> windows::core::Result<Self> {
+        let device = device.cast::<ID3D11Device5>()?;
+        let context = context.cast::<ID3D11DeviceContext4>()?;
+        let mut fence: Option<ID3D11Fence> = None;
+        unsafe { device.CreateFence(0, D3D11_FENCE_FLAG_NONE, &mut fence)?; }
+        let event = unsafe { OwnedHandle::from_raw_handle(CreateEventW(None, false, false, PCWSTR::null())?.0) };
+        Ok(Self { fence: Com(fence.expect("CreateFence returned no fence")), context: Com(context), event, value: AtomicU64::new(0) })
+    }
+
+    fn signal(&self) -> windows::core::Result<u64> {
+        let value = self.value.fetch_add(1, Ordering::Relaxed) + 1;
+        unsafe { self.context.0.Signal(&self.fence.0, value)?; }
+        Ok(value)
+    }
+
+    fn wait(&self, value: u64) -> windows::core::Result<()> {
+        let event = HANDLE(self.event.as_raw_handle());
+        unsafe {
+            self.fence.0.SetEventOnCompletion(value, event)?;
+            match WaitForSingleObject(event, 1_500) {
+                WAIT_OBJECT_0 if self.fence.0.GetCompletedValue() != u64::MAX => Ok(()),
+                WAIT_OBJECT_0 | WAIT_TIMEOUT => {
+                    self.context.0.GetDevice()?.GetDeviceRemovedReason()?;
+                    Err(HRESULT::from_win32(ERROR_TIMEOUT.0).into())
+                }
+                _ => Err(windows::core::Error::from_thread()),
+            }
+        }
+    }
 }
 
 impl Canvas {
@@ -104,25 +159,29 @@ impl Canvas {
     /// convert fails the recording: its frames would be empty (green).
     fn snapshot(&self, slot: usize) -> windows::core::Result<()> {
         let ctx = &self.context.0;
-        {
-            let _gpu = self.lock.lock().unwrap();
-            unsafe {
-                self.converter.0.convert(slot)?;
-                ctx.End(&self.converted.0);
-                ctx.Flush();
+        let gpu = self.lock.lock().unwrap();
+        self.converter.0.convert(slot)?;
+        match &self.completion {
+            ConversionCompletion::Fence(fence) => {
+                let value = fence.signal()?;
+                unsafe { ctx.Flush(); }
+                drop(gpu);
+                fence.wait(value)
+            }
+            ConversionCompletion::Query(query) => {
+                unsafe { ctx.End(&query.0); ctx.Flush(); }
+                drop(gpu);
+                wait_for_conversion(
+                    || {
+                        let mut done = BOOL(0);
+                        let data = Some((&raw mut done).cast());
+                        unsafe { ctx.GetData(&query.0, data, size_of::<BOOL>() as u32, D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32)?; }
+                        Ok(done.as_bool())
+                    },
+                    || thread::sleep(Duration::from_millis(1)),
+                )
             }
         }
-        wait_for_conversion(
-            || {
-                let mut done = BOOL(0);
-                let data = Some((&raw mut done).cast());
-                unsafe {
-                    ctx.GetData(&self.converted.0, data, size_of::<BOOL>() as u32, 0)?;
-                }
-                Ok(done.as_bool())
-            },
-            || thread::sleep(Duration::from_millis(1)),
-        )
     }
 }
 
@@ -160,9 +219,10 @@ struct Inner {
 
 pub struct Encoder {
     inner: Arc<Inner>,
-    audio_tx: Option<SyncSender<Vec<u8>>>,
+    audio_tx: Option<SyncSender<AudioBlock>>,
     threads: Vec<JoinHandle<()>>,
     input: (u32, u32),
+    stretch_display: bool,
     device: Com<ID3D11Device>,
     overlay: Option<(Corner, CameraSize)>,
     /// The newest webcam picture, scaled, and where it goes: (x, y, width, height).
@@ -202,12 +262,11 @@ impl Encoder {
         let h264 = H264::new(device, s.output, fps, s.bitrate)
             .map_err(|e| tr!("no se pudo iniciar el codificador H.264: {}", "could not start the H.264 encoder: {}", e))?;
         let encoder_name = h264.name.clone();
-        let aac = if s.audio { Some(Aac::new().map_err(|e| e.to_string())?) } else { None };
-        let audio_format = match &aac {
-            Some(aac) => Some(Com(aac.output_type().map_err(|e| e.to_string())?)),
-            None => None,
-        };
-        outputs.lock().unwrap().set_audio_format(audio_format);
+        let aac = (0..s.audio_tracks).map(|_| Aac::new().map(Com)).collect::<windows::core::Result<Vec<_>>>()
+            .map_err(|e| e.to_string())?;
+        let audio_formats = aac.iter().map(|aac| aac.0.output_type().map(Com)).collect::<windows::core::Result<Vec<_>>>()
+            .map_err(|e| e.to_string())?;
+        outputs.lock().unwrap().set_audio_formats(audio_formats);
         let canvas = create_canvas(device, s.input, s.output).map_err(|e| e.to_string())?;
         let inner = Arc::new(Inner {
             canvas,
@@ -225,46 +284,45 @@ impl Encoder {
         let spawn = |name: &str, work: Box<dyn FnOnce() + Send>| {
             thread::Builder::new().name(name.into()).spawn(work).map_err(|e| e.to_string())
         };
-        let mut threads = Vec::new();
-        let h264 = Com(h264);
-        threads.push(spawn("video-encoder", Box::new({
-            let inner = inner.clone();
-            move || encode_video(&inner, h264)
-        }))?);
-        threads.push(spawn("video-frames", Box::new({
-            let inner = inner.clone();
-            move || produce_frames(&inner)
-        }))?);
-        let (audio_tx, audio_rx) = mpsc::sync_channel(AUDIO_QUEUE_CAPACITY);
-        if let Some(aac) = aac {
-            let aac = Com(aac);
-            threads.push(spawn("audio-encoder", Box::new({
-                let inner = inner.clone();
-                move || encode_audio(&inner, aac, audio_rx)
-            }))?);
-        }
-
-        Ok(Self {
-            inner,
-            audio_tx: s.audio.then_some(audio_tx),
-            threads,
+        let mut encoder = Self {
+            inner: inner.clone(),
+            audio_tx: None,
+            threads: Vec::new(),
             input: s.input,
+            stretch_display: s.stretch_display,
             device: Com(device.clone()),
             overlay: s.overlay,
             overlay_texture: Mutex::new(None),
             scaler: Mutex::new(None),
             encoder_name,
             _media: media,
-        })
+        };
+        let h264 = Com(h264);
+        encoder.threads.push(spawn("video-encoder", Box::new({
+            let inner = inner.clone();
+            move || encode_video(&inner, h264)
+        }))?);
+        encoder.threads.push(spawn("video-frames", Box::new({
+            let inner = inner.clone();
+            move || produce_frames(&inner)
+        }))?);
+        if !aac.is_empty() {
+            let (audio_tx, audio_rx) = mpsc::sync_channel(AUDIO_QUEUE_CAPACITY);
+            encoder.threads.push(spawn("audio-encoder", Box::new({
+                let inner = inner.clone();
+                move || encode_audio(&inner, aac, audio_rx)
+            }))?);
+            encoder.audio_tx = Some(audio_tx);
+        }
+        Ok(encoder)
     }
 
     /// Draws a captured frame onto the canvas, with the webcam on top (capture thread only):
     /// the part of it starting at `region`'s origin, or all of it, scaled to fit if the source
     /// changed size (a resized window).
-    pub fn push_frame(&self, frame: &Frame, region: Option<(u32, u32)>) {
+    pub fn push_frame(&self, source: &ID3D11Texture2D, (w, h): (u32, u32), region: Option<(u32, u32)>) {
         let canvas = &self.inner.canvas;
-        let (ctx, dst, source) = (&canvas.context.0, &canvas.texture.0, frame.as_raw_texture());
-        let (w, h) = (frame.width(), frame.height());
+        let (ctx, dst) = (&canvas.context.0, &canvas.texture.0);
         let _gpu = canvas.lock.lock().unwrap();
         unsafe {
             let placement = placement((w, h), self.input, region);
@@ -298,7 +356,12 @@ impl Encoder {
         let mut scaler = self.scaler.lock().unwrap();
         if scaler.as_ref().is_none_or(|(made_for, _)| *made_for != size) {
             let canvas = &self.inner.canvas.texture.0;
-            let made = Scaler::new(&self.device.0, canvas, size, self.input, fit(size, self.input)).ok().map(Com);
+            let area = if self.stretch_display {
+                RECT { left: 0, top: 0, right: self.input.0 as i32, bottom: self.input.1 as i32 }
+            } else {
+                fit(size, self.input)
+            };
+            let made = Scaler::new(&self.device.0, canvas, size, self.input, area).ok().map(Com);
             *scaler = Some((size, made));
         }
         let Some((_, Some(scaler))) = scaler.as_ref() else { return false };
@@ -349,9 +412,16 @@ impl Encoder {
         &self.encoder_name
     }
 
-    pub fn push_audio(&self, pcm: Vec<u8>) {
+    pub fn completion_method(&self) -> &'static str {
+        match self.inner.canvas.completion {
+            ConversionCompletion::Fence(_) => "D3D11 fence",
+            ConversionCompletion::Query(_) => "D3D11 event query",
+        }
+    }
+
+    pub fn push_audio_track(&self, track: usize, pcm: Vec<u8>) {
         if let Some(tx) = &self.audio_tx {
-            queue_audio(tx, &self.inner.output, pcm);
+            queue_audio(tx, &self.inner.output, (track, pcm));
         }
     }
 
@@ -417,21 +487,29 @@ fn create_canvas(device: &ID3D11Device, (w, h): (u32, u32), output: (u32, u32)) 
     };
     let mut texture = None;
     let mut target = None;
-    let mut converted = None;
     unsafe {
         device.CreateTexture2D(&desc, None, Some(&mut texture))?;
         let texture = texture.as_ref().expect("CreateTexture2D returned no texture");
         device.CreateRenderTargetView(texture, None, Some(&mut target))?;
-        device.CreateQuery(&D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 }, Some(&mut converted))?;
     }
     let texture = texture.expect("CreateTexture2D returned no texture");
     let converter = Converter::new(device, &texture, (w, h), output, FRAME_TEXTURES)?;
+    let context = unsafe { device.GetImmediateContext()? };
+    let completion = match GpuFence::new(device, &context) {
+        Ok(fence) => ConversionCompletion::Fence(fence),
+        Err(_) => {
+            let mut query = None;
+            let desc = D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 };
+            unsafe { device.CreateQuery(&desc, Some(&mut query))?; }
+            ConversionCompletion::Query(Com(query.expect("CreateQuery returned no query")))
+        }
+    };
     Ok(Canvas {
         texture: Com(texture),
         target: Com(target.expect("CreateRenderTargetView returned no view")),
-        context: Com(unsafe { device.GetImmediateContext()? }),
+        context: Com(context),
         converter: Com(converter),
-        converted: Com(converted.expect("CreateQuery returned no query")),
+        completion,
         ready: AtomicBool::new(false),
         lock: Mutex::new(()),
     })
@@ -576,8 +654,8 @@ fn encode_video(inner: &Inner, h264: Com<H264>) {
 }
 
 /// Encodes the mixer's PCM to AAC until the encoder is finished.
-fn queue_audio(tx: &SyncSender<Vec<u8>>, outputs: &Mutex<Outputs>, pcm: Vec<u8>) {
-    if let Err(error) = tx.try_send(pcm) {
+fn queue_audio(tx: &SyncSender<AudioBlock>, outputs: &Mutex<Outputs>, block: AudioBlock) {
+    if let Err(error) = tx.try_send(block) {
         let reason = match error {
             mpsc::TrySendError::Full(_) => "Кодировщик звука не успевает обрабатывать данные.",
             mpsc::TrySendError::Disconnected(_) => "Кодировщик звука остановился.",
@@ -586,20 +664,22 @@ fn queue_audio(tx: &SyncSender<Vec<u8>>, outputs: &Mutex<Outputs>, pcm: Vec<u8>)
     }
 }
 
-fn encode_audio(inner: &Inner, aac: Com<Aac>, rx: Receiver<Vec<u8>>) {
-    let mut aac = aac.0;
+fn encode_audio(inner: &Inner, mut encoders: Vec<Com<Aac>>, rx: Receiver<AudioBlock>) {
     let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    for pcm in rx {
-        match aac.encode(&pcm) {
-            Ok(packets) => inner.output.lock().unwrap().audio(packets),
+    for (track, pcm) in rx {
+        let Some(aac) = encoders.get_mut(track) else { continue };
+        match aac.0.encode(&pcm) {
+            Ok(packets) => inner.output.lock().unwrap().audio(track, packets),
             Err(e) => {
                 inner.output.lock().unwrap().encoder_error(format!("Ошибка кодирования звука: {e}"));
                 break;
             }
         }
     }
-    if let Ok(packets) = aac.drain() {
-        inner.output.lock().unwrap().audio(packets);
+    for (track, aac) in encoders.iter_mut().enumerate() {
+        if let Ok(packets) = aac.0.drain() {
+            inner.output.lock().unwrap().audio(track, packets);
+        }
     }
 }
 
@@ -706,8 +786,8 @@ mod tests {
         let clock = Arc::new(Clock::new());
         let started = Arc::new(AtomicBool::new(false));
         let encoder = Arc::new(Encoder::new(&device.unwrap(), EncoderSettings {
-            input: (320, 180), output: (320, 180), fps: 30, bitrate: 1_000_000,
-            audio: true, overlay: None,
+            input: (320, 180), output: (320, 180), stretch_display: false, fps: 30, bitrate: 1_000_000,
+            audio_tracks: 1, overlay: None,
         }, clock.clone(), started.clone(), outputs.clone()).unwrap());
         {
             let canvas = &encoder.inner.canvas;
@@ -716,7 +796,7 @@ mod tests {
             canvas.ready.store(true, Ordering::Release);
         }
         let sink = encoder.clone();
-        let mixer = Mixer::start(vec![selected.shared.clone()], started, clock, move |pcm| sink.push_audio(pcm));
+        let mixer = Mixer::start(vec![selected.shared.clone()], started, clock, move |pcm| sink.push_audio_track(0, pcm));
         std::thread::sleep(Duration::from_secs(2));
         {
             let canvas = &encoder.inner.canvas;
@@ -769,13 +849,13 @@ mod tests {
             outputs.set_replay(Some(45));
         }
         let (sender, receiver) = mpsc::sync_channel(1);
-        queue_audio(&sender, &outputs, vec![1]);
+        queue_audio(&sender, &outputs, (0, vec![1]));
         assert!(!outputs.lock().unwrap().failed());
-        queue_audio(&sender, &outputs, vec![2]);
+        queue_audio(&sender, &outputs, (0, vec![2]));
         let outputs = outputs.lock().unwrap();
         assert!(outputs.failed());
         assert!(outputs.replay_error().is_some());
-        assert_eq!(receiver.try_recv().unwrap(), vec![1]);
+        assert_eq!(receiver.try_recv().unwrap(), (0, vec![1]));
     }
 
     fn rect(r: RECT) -> (i32, i32, i32, i32) {

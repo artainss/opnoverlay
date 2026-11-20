@@ -111,17 +111,63 @@ pub fn square_window_corners(window: isize) {
     };
 }
 
-pub fn prepare_slide_in(window: isize) {
+pub fn active_display() -> Option<isize> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint, MonitorFromWindow};
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetForegroundWindow};
+    unsafe {
+        let foreground = GetForegroundWindow();
+        let monitor = if !foreground.0.is_null() && foreground_is_external() {
+            MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST)
+        } else {
+            let mut cursor = POINT::default();
+            let _ = GetCursorPos(&mut cursor);
+            MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST)
+        };
+        (!monitor.0.is_null()).then_some(monitor.0 as isize)
+    }
+}
+
+pub fn display_bounds(display: isize) -> Option<windows::Win32::Foundation::RECT> {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe { GetMonitorInfoW(HMONITOR(display as *mut _), &mut info).as_bool() }.then_some(info.rcMonitor)
+}
+
+pub fn prepare_slide_in(window: isize, x: i32, y: i32) {
     use windows::Win32::UI::WindowsAndMessaging::{GetWindowPlacement, IsIconic, SetWindowPlacement, WINDOWPLACEMENT};
     let hwnd = HWND(window as *mut _);
     unsafe {
         let mut placement = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
         if IsIconic(hwnd).as_bool() && GetWindowPlacement(hwnd, &mut placement).is_ok() {
             let width = placement.rcNormalPosition.right - placement.rcNormalPosition.left;
-            placement.rcNormalPosition.left = -width;
-            placement.rcNormalPosition.right = 0;
+            let height = placement.rcNormalPosition.bottom - placement.rcNormalPosition.top;
+            placement.rcNormalPosition.left = x;
+            placement.rcNormalPosition.top = y;
+            placement.rcNormalPosition.right = x + width;
+            placement.rcNormalPosition.bottom = y + height;
             let _ = SetWindowPlacement(hwnd, &placement);
         }
+    }
+}
+
+pub fn position_overlay(window: isize, x: i32, y: i32, clip_left: i32) {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject, ERROR, GetWindowRgnBox, SetWindowRgn};
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, GetWindowRect, SetWindowPos, SM_CMONITORS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER};
+    let hwnd = HWND(window as *mut _);
+    unsafe {
+        let mut rect = RECT::default();
+        if clip_left > 0 && GetSystemMetrics(SM_CMONITORS) > 1 && GetWindowRect(hwnd, &mut rect).is_ok() {
+            let width = (rect.right - rect.left).max(0);
+            let region = CreateRectRgn(clip_left.min(width), 0, width, rect.bottom - rect.top);
+            if !region.is_invalid() && SetWindowRgn(hwnd, Some(region), true) == 0 {
+                let _ = DeleteObject(region.into());
+            }
+        } else if GetWindowRgnBox(hwnd, &mut rect).0 != ERROR {
+            SetWindowRgn(hwnd, None, true);
+        }
+        let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 
@@ -338,6 +384,7 @@ fn startup_command(executable: &Path) -> Result<String, String> {
 }
 
 fn startup_entry(write: Option<bool>) -> Result<bool, String> {
+    if crate::config::portable_dir().is_some() { return Ok(false); }
     use windows::core::w;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     startup_entry_at(w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run"), w!("opnoverlay"), &exe, write)

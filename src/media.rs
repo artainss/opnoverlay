@@ -33,6 +33,16 @@ pub trait Muxer: Sized + Send {
     
     fn write(&self, video: bool, packet: &Packet) -> Result<(), String>;
     fn finish(self) -> Result<(), String>;
+
+    fn create_audio_tracks(path: &Path, video: &Self::Format, audio: &[Self::Format], start: i64) -> Result<Self, String> {
+        if audio.len() > 1 { return Err("Multiple audio tracks are unavailable".into()); }
+        Self::create(path, video, audio.first(), start)
+    }
+
+    fn write_audio_track(&self, track: usize, packet: &Packet) -> Result<(), String> {
+        if track != 0 { return Err("Audio track is unavailable".into()); }
+        self.write(false, packet)
+    }
 }
 
 
@@ -62,10 +72,10 @@ pub struct Outputs<M: Muxer> {
     path: Option<PathBuf>,
     file: Option<M>,
     
-    pending_audio: VecDeque<Packet>,
+    pending_audio: VecDeque<(usize, Packet)>,
     replay: Option<Ring>,
     video_format: Option<M::Format>,
-    audio_format: Option<M::Format>,
+    audio_formats: Vec<M::Format>,
     
     keyframe_wanted: bool,
     error: Option<String>,
@@ -90,7 +100,7 @@ impl<M: Muxer> Default for Outputs<M> {
             pending_audio: VecDeque::new(),
             replay: None,
             video_format: None,
-            audio_format: None,
+            audio_formats: Vec::new(),
             keyframe_wanted: false,
             error: None,
             paused: false,
@@ -155,8 +165,8 @@ impl<M: Muxer> Outputs<M> {
         self.replay = seconds.map(|s| Ring::new(s as i64 * TICKS_PER_SECOND));
     }
 
-    pub fn set_replay_on_disk(&mut self, seconds: u32) -> Result<(), String> {
-        let segment = crate::disk_buffer::Segment::new().map_err(|e| e.to_string())?;
+    pub fn set_replay_on_disk(&mut self, seconds: u32, budget: Arc<crate::disk_buffer::DiskBudget>, limit: u64) -> Result<(), String> {
+        let segment = crate::disk_buffer::Segment::new(budget, limit).map_err(|e| e.to_string())?;
         let mut ring = Ring::new(seconds as i64 * TICKS_PER_SECOND);
         ring.segment = Some(segment);
         self.replay = Some(ring);
@@ -177,15 +187,15 @@ impl<M: Muxer> Outputs<M> {
         let video_format = self.video_format.clone().ok_or_else(empty)?;
         Ok(Replay {
             video_format,
-            audio_format: self.audio_format.clone(),
+            audio_formats: self.audio_formats.clone(),
             video: ring.video.iter().cloned().collect(),
             audio: ring.audio.iter().cloned().collect(),
         })
     }
 
     
-    pub fn set_audio_format(&mut self, format: Option<M::Format>) {
-        self.audio_format = format;
+    pub fn set_audio_formats(&mut self, formats: Vec<M::Format>) {
+        self.audio_formats = formats;
     }
 
     pub fn take_keyframe_request(&mut self) -> bool {
@@ -210,10 +220,10 @@ impl<M: Muxer> Outputs<M> {
         if let (Some(path), None, None, true, false, Some(video)) =
             (&self.path, &self.file, &self.error, packet.key, self.paused, &self.video_format)
         {
-            match M::create(path, video, self.audio_format.as_ref(), packet.time) {
+            match M::create_audio_tracks(path, video, &self.audio_formats, packet.time) {
                 Ok(file) => {
-                    for audio in self.pending_audio.drain(..) {
-                        if let Err(error) = file.write(false, &audio) {
+                    for (track, audio) in self.pending_audio.drain(..) {
+                        if let Err(error) = file.write_audio_track(track, &audio) {
                             self.error.get_or_insert(error);
                             break;
                         }
@@ -229,12 +239,12 @@ impl<M: Muxer> Outputs<M> {
             
             self.skipped += packet.time - self.file_end;
             (self.resuming, self.resumed_at) = (false, packet.time);
-            for audio in std::mem::take(&mut self.pending_audio) {
-                self.write_file(false, &audio);
+            for (track, audio) in std::mem::take(&mut self.pending_audio) {
+                self.write_file(Some(track), &audio);
             }
         }
         if !self.paused && !self.resuming {
-            self.write_file(true, &packet);
+            self.write_file(None, &packet);
             self.file_end = self.file_end.max(packet.time + packet.duration);
         }
         if let Some(ring) = &mut self.replay {
@@ -242,7 +252,7 @@ impl<M: Muxer> Outputs<M> {
         }
     }
 
-    pub fn audio(&mut self, packets: Vec<Packet>) {
+    pub fn audio(&mut self, track: usize, packets: Vec<Packet>) {
         for packet in packets {
             
             
@@ -251,27 +261,27 @@ impl<M: Muxer> Outputs<M> {
                 _ if self.path.is_some() && self.error.is_some() => {}
                 
                 _ if self.paused && paused => {}
-                Some(_) if !paused => self.write_file(false, &packet),
+                Some(_) if !paused => self.write_file(Some(track), &packet),
                 
-                Some(_) => self.pending_audio.push_back(packet.clone()),
+                Some(_) => self.pending_audio.push_back((track, packet.clone())),
                 None => {
-                    self.pending_audio.push_back(packet.clone());
+                    self.pending_audio.push_back((track, packet.clone()));
                     
                     if self.path.is_none() || self.error.is_some() {
-                        while self.pending_audio.front().is_some_and(|p| p.time < packet.time - TICKS_PER_SECOND) {
+                        while self.pending_audio.front().is_some_and(|(_, p)| p.time < packet.time - TICKS_PER_SECOND) {
                             self.pending_audio.pop_front();
                         }
                     }
                 }
             }
             if self.path.is_some() && self.error.is_none()
-                && self.pending_audio.front().is_some_and(|first| packet.time.saturating_sub(first.time) > 10 * TICKS_PER_SECOND)
+                && self.pending_audio.front().is_some_and(|(_, first)| packet.time.saturating_sub(first.time) > 10 * TICKS_PER_SECOND)
             {
                 self.record_error("Не удалось получить опорный кадр для записи.".into());
                 self.pending_audio.clear();
             }
             if let Some(ring) = &mut self.replay {
-                ring.push_audio(packet);
+                ring.push_audio(track, packet);
             }
         }
     }
@@ -289,13 +299,17 @@ impl<M: Muxer> Outputs<M> {
 
     
     
-    fn write_file(&mut self, video: bool, packet: &Packet) {
+    fn write_file(&mut self, track: Option<usize>, packet: &Packet) {
         let Some(file) = &self.file else { return };
-        if !video && (self.paused_from..self.resumed_at).contains(&packet.time) {
+        if track.is_some() && (self.paused_from..self.resumed_at).contains(&packet.time) {
             return;
         }
         let time = packet.time - self.skipped;
-        let result = if self.skipped == 0 { file.write(video, packet) } else { file.write(video, &Packet { time, ..packet.clone() }) };
+        let write = |packet: &Packet| match track {
+            Some(track) => file.write_audio_track(track, packet),
+            None => file.write(true, packet),
+        };
+        let result = if self.skipped == 0 { write(packet) } else { write(&Packet { time, ..packet.clone() }) };
         if let Err(e) = result {
             self.error.get_or_insert(e);
         }
@@ -310,6 +324,9 @@ pub struct PendingFile<M: Muxer> {
 }
 
 impl<M: Muxer> PendingFile<M> {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
     
     
     pub fn finish(self) -> Result<PathBuf, String> {
@@ -348,6 +365,7 @@ enum StoredData {
 #[derive(Clone, Debug)]
 struct StoredPacket {
     data: StoredData,
+    audio_track: Option<usize>,
     time: i64,
     duration: i64,
     key: bool,
@@ -368,14 +386,38 @@ impl Ring {
         Self { length, video: VecDeque::new(), audio: VecDeque::new(), segment: None, segment_start: None, error: None }
     }
 
-    fn store(&mut self, packet: Packet) -> Option<StoredPacket> {
+    fn store(&mut self, packet: Packet, audio_track: Option<usize>) -> Option<StoredPacket> {
         if self.error.is_some() { return None; }
-        if self.segment.is_some() {
+        let begins_video_group = audio_track.is_none() && packet.key;
+        if let Some(segment) = self.segment.as_ref() {
             let start = *self.segment_start.get_or_insert(packet.time);
-            if packet.time.saturating_sub(start) >= (self.length / 128).max(2 * TICKS_PER_SECOND) {
-                match crate::disk_buffer::Segment::new() {
+            let len = packet.data.len();
+            let nearing_rotation = packet.time.saturating_sub(start) >= (self.length / 128).max(2 * TICKS_PER_SECOND);
+            if !segment.is_empty() && (nearing_rotation || (begins_video_group && segment.ready_to_rotate()) || !segment.has_space(len)) {
+                match segment.next() {
                     Ok(segment) => { self.segment = Some(segment); self.segment_start = Some(packet.time); }
                     Err(error) => { self.error = Some(format!("Ошибка создания буфера отката: {error}")); return None; }
+                }
+            }
+            while self.segment.as_ref().is_some_and(|segment| !segment.has_space(len)) {
+                if let Some(next) = self.next_keyframe() {
+                    self.video.drain(..next);
+                    self.trim_audio();
+                } else {
+                    if begins_video_group {
+                        self.video.clear();
+                        self.audio.retain(|audio| audio.time >= packet.time);
+                    } else if self.video.is_empty() {
+                        self.audio.clear();
+                    }
+                    if self.segment.as_ref().is_some_and(|segment| !segment.has_space(len)) {
+                        self.error = Some(crate::i18n::tr3!(
+                            "El búfer de repetición alcanzó su límite de disco.",
+                            "The replay buffer reached its disk limit.",
+                            "Достигнут лимит буфера откатов на диске."
+                        ).into());
+                        return None;
+                    }
                 }
             }
         }
@@ -386,7 +428,7 @@ impl Ring {
             },
             None => StoredData::Memory(packet.data),
         };
-        Some(StoredPacket { data, time: packet.time, duration: packet.duration, key: packet.key })
+        Some(StoredPacket { data, audio_track, time: packet.time, duration: packet.duration, key: packet.key })
     }
 
     fn push_video(&mut self, packet: Packet) {
@@ -398,10 +440,10 @@ impl Ring {
             return;
         }
         let oldest_needed = packet.time - self.length;
-        let Some(packet) = self.store(packet) else { return };
+        let Some(packet) = self.store(packet, None) else { return };
         self.video.push_back(packet);
         
-        while let Some(next) = self.video.iter().skip(1).position(|p| p.key).map(|i| i + 1)
+        while let Some(next) = self.next_keyframe()
             && self.video[next].time <= oldest_needed
         {
             self.video.drain(..next);
@@ -409,14 +451,15 @@ impl Ring {
         self.trim_audio();
     }
 
-    fn push_audio(&mut self, packet: Packet) {
+    fn push_audio(&mut self, track: usize, packet: Packet) {
         if self.error.is_some() { return; }
         if self.video.back().is_some_and(|last| packet.time.saturating_sub(last.time) > 10 * TICKS_PER_SECOND) {
             self.error = Some("Откат остановлен: видеокодировщик перестал выдавать кадры.".into());
             return;
         }
-        let Some(packet) = self.store(packet) else { return };
-        self.audio.push_back(packet);
+        let Some(packet) = self.store(packet, Some(track)) else { return };
+        let index = self.audio.iter().rposition(|other| other.time <= packet.time).map_or(0, |index| index + 1);
+        self.audio.insert(index, packet);
         self.trim_audio();
     }
 
@@ -431,12 +474,16 @@ impl Ring {
             self.audio.pop_front();
         }
     }
+
+    fn next_keyframe(&self) -> Option<usize> {
+        self.video.iter().skip(1).position(|packet| packet.key).map(|index| index + 1)
+    }
 }
 
 
 pub struct Replay<M: Muxer> {
     video_format: M::Format,
-    audio_format: Option<M::Format>,
+    audio_formats: Vec<M::Format>,
     video: Vec<StoredPacket>,
     audio: Vec<StoredPacket>,
 }
@@ -478,7 +525,7 @@ impl<M: Muxer> Replay<M> {
 
     pub fn save(self, path: PathBuf) -> Result<PathBuf, String> {
         let start = self.video[0].time;
-        let file = M::create(&path, &self.video_format, self.audio_format.as_ref(), start)?;
+        let file = M::create_audio_tracks(&path, &self.video_format, &self.audio_formats, start)?;
         
         let (mut audio, mut video) = (self.audio.iter().peekable(), self.video.iter().peekable());
         loop {
@@ -488,8 +535,11 @@ impl<M: Muxer> Replay<M> {
                 (None, Some(_)) => true,
                 (None, None) => break,
             };
-            let packet = if is_video { video.next() } else { audio.next() };
-            let result = packet.expect("peeked").load().and_then(|packet| file.write(is_video, &packet));
+            let stored = (if is_video { video.next() } else { audio.next() }).expect("peeked");
+            let result = stored.load().and_then(|packet| match stored.audio_track {
+                Some(track) => file.write_audio_track(track, &packet),
+                None => file.write(true, &packet),
+            });
             if let Err(e) = result {
                 
                 let _ = file.finish();
@@ -572,7 +622,7 @@ mod tests {
         for n in 0..seconds * 30 {
             let time = n * TICKS_PER_SECOND / 30;
             while audio <= time {
-                ring.push_audio(packet(audio, true));
+                ring.push_audio(0, packet(audio, true));
                 audio += audio_step;
             }
             ring.push_video(packet(time, n % 60 == 0));
@@ -614,10 +664,10 @@ mod tests {
     fn replay_stops_buffering_audio_when_video_encoder_stalls() {
         for disk in [false, true] {
             let mut ring = Ring::new(60 * TICKS_PER_SECOND);
-            if disk { ring.segment = Some(crate::disk_buffer::Segment::new().unwrap()); }
+            if disk { ring.segment = Some(crate::disk_buffer::Segment::new(Arc::default(), u64::MAX).unwrap()); }
             ring.push_video(packet(0, true));
             for second in 1..=120 {
-                ring.push_audio(packet(second * TICKS_PER_SECOND, true));
+                ring.push_audio(0, packet(second * TICKS_PER_SECOND, true));
             }
             assert_eq!(ring.audio.len(), 10);
             assert!(ring.error.as_deref().is_some_and(|error| error.contains("перестал выдавать кадры")));
@@ -630,7 +680,7 @@ mod tests {
         let mut outputs = Outputs::<FakeMuxer>::default();
         outputs.start_file("recording.mp4".into());
         for second in 0..=120 {
-            outputs.audio(vec![packet(second * TICKS_PER_SECOND, true)]);
+            outputs.audio(0, vec![packet(second * TICKS_PER_SECOND, true)]);
         }
         assert!(outputs.failed());
         assert!(outputs.pending_audio.len() <= 2);
@@ -646,7 +696,7 @@ mod tests {
         outputs.set_file_paused(true);
         outputs.set_file_paused(false);
         for second in 1..=120 {
-            outputs.audio(vec![packet(second * TICKS_PER_SECOND, true)]);
+            outputs.audio(0, vec![packet(second * TICKS_PER_SECOND, true)]);
         }
         assert!(outputs.failed());
         assert!(outputs.pending_audio.is_empty());
@@ -657,9 +707,9 @@ mod tests {
         for disk in [false, true] {
             let written = Arc::new(Mutex::new(Vec::new()));
             let mut outputs = Outputs::<FakeMuxer>::default();
-            if disk { outputs.set_replay_on_disk(60).unwrap(); } else { outputs.set_replay(Some(60)); }
+            if disk { outputs.set_replay_on_disk(60, Arc::default(), u64::MAX).unwrap(); } else { outputs.set_replay(Some(60)); }
             outputs.video(packet(0, true), || Ok(written));
-            outputs.audio(vec![packet(1, true)]);
+            outputs.audio(0, vec![packet(1, true)]);
             let replay = outputs.replay().unwrap();
             assert_eq!(replay.encoded_bytes(), 8);
             assert!(ensure_replay_space(replay.encoded_bytes(), Some(7)).is_err());
@@ -736,7 +786,7 @@ mod tests {
         assert!(outputs.failed(), "the app must hear of it while recording");
         
         for n in 1..100 {
-            outputs.audio(vec![packet(n * TICKS_PER_SECOND / 10, true)]);
+            outputs.audio(0, vec![packet(n * TICKS_PER_SECOND / 10, true)]);
             outputs.video(packet(n * TICKS_PER_SECOND / 10, n % 10 == 0), || unreachable!());
         }
         assert_eq!(calls.lock().unwrap().creates, 1, "not tried again at every keyframe");
@@ -764,7 +814,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Calls { fail_audio: true, ..Calls::default() }));
         let mut outputs = Outputs::<Broken>::default();
         outputs.start_file(PathBuf::from("rec.mp4"));
-        outputs.audio(vec![packet(10, true)]);
+        outputs.audio(0, vec![packet(10, true)]);
         outputs.video(packet(0, true), || Ok(calls.clone()));
         assert!(outputs.failed());
         assert!(outputs.take_file().unwrap().finish().unwrap_err().contains("disk full"));
@@ -788,14 +838,14 @@ mod tests {
         let mut outputs = Outputs::<FakeMuxer>::default();
         
         outputs.video(packet(0, true), || Ok(written.clone()));
-        outputs.audio(vec![packet(5, true)]);
+        outputs.audio(0, vec![packet(5, true)]);
         outputs.start_file(PathBuf::from("rec.mp4"));
         assert!(outputs.take_keyframe_request(), "a new recording must ask for a keyframe");
         assert!(!outputs.take_keyframe_request(), "the request is taken once");
-        outputs.audio(vec![packet(15, true)]);
+        outputs.audio(0, vec![packet(15, true)]);
         outputs.video(packet(10, false), || unreachable!());
         outputs.video(packet(20, true), || unreachable!());
-        outputs.audio(vec![packet(25, true)]);
+        outputs.audio(0, vec![packet(25, true)]);
         
         
         assert_eq!(*written.lock().unwrap(), vec![(true, 0), (false, 5)]);
@@ -818,7 +868,7 @@ mod tests {
         outputs.set_replay(Some(20));
         assert!(outputs.replay().is_err(), "nothing to save yet");
         outputs.video(packet(100, true), || Ok(written.clone()));
-        outputs.audio(vec![packet(90, true), packet(110, true)]);
+        outputs.audio(0, vec![packet(90, true), packet(110, true)]);
         outputs.video(packet(120, false), || unreachable!());
         let replay = outputs.replay().unwrap();
         thread::spawn(move || replay.save(PathBuf::from("replay.mp4")).unwrap()).join().unwrap();
@@ -831,7 +881,7 @@ mod tests {
         let mut outputs = Outputs::<FakeMuxer>::default();
         outputs.set_replay(Some(1));
         outputs.video(packet(0, true), || Ok(written.clone()));
-        outputs.audio(vec![packet(1, true)]);
+        outputs.audio(0, vec![packet(1, true)]);
         let replay = outputs.replay().unwrap();
         let ring = outputs.replay.as_ref().unwrap();
         assert!(matches!((&ring.video[0].data, &replay.video[0].data), (StoredData::Memory(a), StoredData::Memory(b)) if Arc::ptr_eq(a, b)));
@@ -847,9 +897,9 @@ mod tests {
     fn disk_replay_survives_eviction_and_preserves_packet_order() {
         let written = Arc::new(Mutex::new(Vec::new()));
         let mut outputs = Outputs::<FakeMuxer>::default();
-        outputs.set_replay_on_disk(1).unwrap();
+        outputs.set_replay_on_disk(1, Arc::default(), u64::MAX).unwrap();
         outputs.video(packet(0, true), || Ok(written.clone()));
-        outputs.audio(vec![packet(1, true)]);
+        outputs.audio(0, vec![packet(1, true)]);
         let replay = outputs.replay().unwrap();
         assert!(matches!(replay.video[0].data, StoredData::Disk(_)));
         outputs.video(packet(2 * TICKS_PER_SECOND, true), || unreachable!());
@@ -889,7 +939,7 @@ mod tests {
     fn disk_segments_live_until_saved_replay_releases_them() {
         let written = Arc::new(Mutex::new(Vec::new()));
         let mut outputs = Outputs::<FakeMuxer>::default();
-        outputs.set_replay_on_disk(1).unwrap();
+        outputs.set_replay_on_disk(1, Arc::default(), u64::MAX).unwrap();
         let segment = Arc::downgrade(outputs.replay.as_ref().unwrap().segment.as_ref().unwrap());
         outputs.video(packet(0, true), || Ok(written.clone()));
         let snapshot = outputs.replay().unwrap();
@@ -903,7 +953,7 @@ mod tests {
     #[test]
     fn disk_replay_releases_old_segments_during_long_running_capture() {
         let mut ring = Ring::new(5 * TICKS_PER_SECOND);
-        ring.segment = Some(crate::disk_buffer::Segment::new().unwrap());
+        ring.segment = Some(crate::disk_buffer::Segment::new(Arc::default(), u64::MAX).unwrap());
         let mut seen = Vec::new();
         let mut previous = std::ptr::null();
         for second in 0..=120 {
@@ -926,10 +976,26 @@ mod tests {
     }
 
     #[test]
+    fn disk_cap_shortens_replay_only_at_keyframes() {
+        let mut ring = Ring::new(60 * TICKS_PER_SECOND);
+        ring.segment = Some(crate::disk_buffer::Segment::new(Arc::default(), 32).unwrap());
+        for second in 0..60 {
+            ring.push_video(packet(second * TICKS_PER_SECOND, second % 2 == 0));
+            ring.push_audio(0, packet(second * TICKS_PER_SECOND + 1, true));
+            assert!(ring.error.is_none(), "buffer stopped at second {second}: {:?}", ring.error);
+        }
+        let first = ring.video.front().unwrap();
+        assert!(first.key);
+        assert!(first.time >= 56 * TICKS_PER_SECOND);
+        assert_eq!(ring.video.back().unwrap().time, 59 * TICKS_PER_SECOND);
+        assert!(ring.audio.front().unwrap().time >= first.time);
+    }
+
+    #[test]
     #[ignore]
     fn disk_replay_limits_real_file_bytes_over_two_minutes() {
         let mut ring = Ring::new(45 * TICKS_PER_SECOND);
-        ring.segment = Some(crate::disk_buffer::Segment::new().unwrap());
+        ring.segment = Some(crate::disk_buffer::Segment::new(Arc::default(), u64::MAX).unwrap());
         let data: Arc<[u8]> = vec![42; 64 * 1024].into();
         let mut seen = Vec::new();
         let mut previous = std::ptr::null();
@@ -960,7 +1026,7 @@ mod tests {
     fn feed(outputs: &mut Outputs<FakeMuxer>, written: &Arc<Mutex<Vec<(bool, i64)>>>, from: i64, to: i64) {
         let step = TICKS_PER_SECOND / 30;
         for n in from * 30..to * 30 {
-            outputs.audio(vec![Packet { duration: step, ..packet(n * step, true) }]);
+            outputs.audio(0, vec![Packet { duration: step, ..packet(n * step, true) }]);
             let key = n % 60 == 0 || outputs.take_keyframe_request();
             outputs.video(Packet { duration: step, ..packet(n * step, key) }, || Ok(written.clone()));
         }
@@ -976,12 +1042,12 @@ mod tests {
         outputs.video(Packet { duration: step, ..packet(step, false) }, || unreachable!());
         outputs.set_file_paused(true);
         
-        outputs.audio(vec![packet(step, true), packet(2 * step, true)]);
+        outputs.audio(0, vec![packet(step, true), packet(2 * step, true)]);
         outputs.set_file_paused(false);
         
-        outputs.audio(vec![packet(3 * step, true)]);
+        outputs.audio(0, vec![packet(3 * step, true)]);
         outputs.video(Packet { duration: step, ..packet(10 * step, true) }, || unreachable!());
-        outputs.audio(vec![packet(5 * step, true), packet(10 * step, true)]);
+        outputs.audio(0, vec![packet(5 * step, true), packet(10 * step, true)]);
         let audio: Vec<i64> = written.lock().unwrap().iter().filter(|(v, _)| !*v).map(|(_, t)| *t).collect();
         assert_eq!(audio, [step, 2 * step], "before the pause, and where the file goes on");
     }
